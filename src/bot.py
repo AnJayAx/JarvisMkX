@@ -465,21 +465,36 @@ class JarvisBot:
     # ─── Conversation Memory ───
 
     def _build_messages(self, question, context, corrections_text=""):
-        messages = []
-        first_user_content = (
-            f"{SYSTEM_PROMPT}\n\n"
+        """Build a chat transcript for the model.
+
+        Important: the retrieved context must always be paired with the *current*
+        user question. Previously, the first question of the session was embedded
+        into the initial prompt and then replayed every turn, which could
+        incorrectly bias subsequent answers.
+        """
+
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+        # Keep limited conversation continuity, but avoid feeding back responses
+        # that are explicitly retrieval failures (they can prime the model to
+        # keep refusing even when later retrieval succeeds).
+        if self.conversation_history:
+            for turn in self.conversation_history:
+                if turn.role == "assistant":
+                    content = (turn.content or "").strip()
+                    if (
+                        "I couldn't retrieve any relevant passages" in content
+                        or content.startswith("⚠️ Low retrieval confidence")
+                    ):
+                        continue
+                messages.append({"role": turn.role, "content": turn.content})
+
+        user_content = (
             f"### Context from Research Paper:\n{context}"
             f"{corrections_text}\n\n"
+            f"### Question:\n{question}"
         )
-        if self.conversation_history:
-            first_user_content += f"### Question:\n{self.conversation_history[0].content}"
-            messages.append({"role": "user", "content": first_user_content})
-            for turn in self.conversation_history[1:]:
-                messages.append({"role": turn.role, "content": turn.content})
-            messages.append({"role": "user", "content": question})
-        else:
-            first_user_content += f"### Question:\n{question}"
-            messages.append({"role": "user", "content": first_user_content})
+        messages.append({"role": "user", "content": user_content})
         return messages
 
     def _add_to_history(self, question, answer):

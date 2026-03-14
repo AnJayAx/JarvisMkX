@@ -1,0 +1,48 @@
+Anything_is_possible.pdf
+
+Q: What is the thesis of possibilism?
+A: All propositions are contingent, and no proposition is necessary.
+Q: What is the thesis of necessitarianism?
+A: There is at least one necessary truth.
+Q: Which two philosophers objected to the strategy of conventionalism?
+A: Popper and Lakatos.
+Q: What specific type of conventionalism did Grünbaum espouse?
+A: Metric conventionalism.
+Q: What is Martin's Theorem?
+A: In a certain weak propositional calculus, no instance of $A\rightarrow A$ is provable.
+Q: What does strong paraconsistentism hold?
+A: Some contradictions are true.
+Q: What does weak paraconsistentism hold?
+A: No contradictions are true, but inconsistent 'worlds' need to be admitted to one's model.
+Q: What is the "Three Monkeys' Decision" regarding negation?
+A: The decision to use negation in such a way that contradictions cannot be true.
+Q: Who authored 'There Is At Least One A Priori Truth'?
+A: Hilary Putnam.
+Q: What possibility arises from the null set definition $\Lambda=_{df}\{x:x\ne x\}$?
+A: A universe in which nothing is self-identical and everything is non-self-identical.
+
+Global_Energy_Demand_For_Different_Energy_Sources.pdf & Trend_Analysis_of_Global_Energy_Demand...pdf
+
+Single File Questions
+Q: What is India's specific target for electrical power capacity from non-fossil fuel sources by the year 2030?
+A: Under its updated Nationally Determined Contributions (NDC), India has committed to achieving an installed capacity of nearly 50% from non-fossil fuel-based energy resources by 2030.
+Q: How did the historical dominance of coal compare to oil in 1929?
+A: In 1929, coal was the dominant energy source, contributing about 79% of total global consumption, while oil contributed no more than 16%.
+Q: Which renewable energy source had the largest share of global production in 2023, and what was its percentage?
+A: Hydroelectricity was the most significant source, accounting for approximately 47% of renewable energy production in 2023.
+Q: What are the three long-term scenarios proposed for the outlook of the global energy landscape?
+A: The three scenarios are: 1. Continuation of the current situation (benchmark projections), 2. Discovery and development of renewable energy sources, and 3. Reliance on depleting energy and the decline of renewable energy.
+Q: What is the "Three Monkeys' Decision" mentioned in the philosophical text?
+A: It is the decision to use negation in a specific way so that contradictions cannot be true, which the author argues is not a plausibly motivated strategy.
+
+Multi-File & Inference Questions
+Q: Based on both papers, what was the impact of the 2020 COVID-19 pandemic on the global energy sector?
+A: Both papers note a decline in 2020. Fossil fuel consumption decreased due to lockdown measures and travel restrictions , and global $CO_{2}$ emissions experienced a notable decline of approximately 5% due to the associated economic slowdown.
+Q: Compare the "peak oil" projections discussed in the two documents. When is the global peak expected?
+A: One document states that global oil production will not reach its peak before 2030. The second document supports this by stating that the dominance of fossil fuels is expected to continue until 2030 and beyond, despite renewable growth.
+Q: How do the documents describe the relationship between economic growth and energy consumption?
+A: Historically, energy is considered the key to contemporary development and a "ruling element" of economic growth. However, more recent data indicates a "decoupling" effect, where global $CO_{2}$ emissions growth has slowed despite ongoing economic growth, largely due to the adoption of clean energy.
+Q: What are the primary environmental consequences of continued fossil fuel use mentioned across the documents?
+A: Continued use leads to increased $CO_{2}$ emissions, which are responsible for approximately 66% of the warming effect on the climate. This contributes to global temperature rise (accelerating to $0.20^{\circ}C$ per decade since 1982), rising sea levels, ecosystem imbalances, and human health impacts like heat strokes and dehydration.
+Q: According to the papers, what role does technological innovation play in the energy transition?
+A: Technological development is at the forefront of the energy shift. Innovations such as high-efficiency "Carbon Capture Utilization and Storage," electric vehicles, smart grids, and graphene-driven devices are expected to alter consumption patterns and help achieve net-zero targets.
