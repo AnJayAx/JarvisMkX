@@ -1,0 +1,37 @@
+# Jarvis Mk.X — Streamlit Application Dependencies
+# Install: pip install -r requirements.txt
+
+# Core ML
+torch
+transformers
+accelerate
+peft
+bitsandbytes
+
+# Embeddings & Retrieval
+sentence-transformers
+voyageai
+chromadb
+rank-bm25
+
+# PDF Processing
+PyMuPDF
+
+# Web App
+streamlit>=1.35.0
+
+# Database
+# SQLite is built into Python — no install needed
+
+# Visualization
+plotly
+matplotlib
+scikit-learn
+
+# PDF Export
+fpdf2
+
+# Utilities
+numpy
+pandas
+Pillow
