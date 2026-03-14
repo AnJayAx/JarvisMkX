@@ -179,16 +179,93 @@ def format_sources_for_db(sources):
         {"section": s.section, "page_numbers": s.page_numbers,
          "score": round(s.score, 4),
          "method": getattr(s, "retrieval_method", "unknown"),
+         # Store full text so the analytics panel can show complete passages.
+         # Keep a short preview for charts / lightweight displays.
+         "text": s.text,
          "text_preview": s.text[:300]}
         for s in sources
     ]
 
 
-def render_pdf_page(filepath, page_num):
+def _normalize_pdf_search_text(text: str) -> str:
+    if not text:
+        return ""
+    # PDFs may contain line breaks/hyphenation; collapse whitespace for matching.
+    return " ".join(str(text).replace("\u00ad", "").split())
+
+
+def _build_search_snippets(text: str) -> list:
+    """Build short snippets likely to match PDF text extraction."""
+    t = _normalize_pdf_search_text(text)
+    if not t:
+        return []
+
+    words = t.split()
+    snippets = []
+
+    # Prefer word-based snippets (more stable than raw character slices).
+    if len(words) >= 6:
+        snippets.append(" ".join(words[:12]))
+    if len(words) >= 24:
+        mid = len(words) // 2
+        snippets.append(" ".join(words[mid: mid + 12]))
+    if len(words) >= 12:
+        snippets.append(" ".join(words[-12:]))
+
+    # Fallback: first ~120 characters.
+    snippets.append(t[:120])
+
+    # De-dupe + drop very short snippets.
+    seen = set()
+    out = []
+    for s in snippets:
+        s = s.strip()
+        if len(s) < 15:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def render_pdf_page(filepath, page_num, highlight_texts=None):
     try:
         doc = fitz.open(filepath)
         page = doc[min(page_num, len(doc) - 1)]
-        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
+
+        # Best-effort highlighting: search for snippets of the retrieved passage.
+        if highlight_texts:
+            try:
+                for text in highlight_texts:
+                    found_any = False
+                    for snippet in _build_search_snippets(text):
+                        try:
+                            hits = page.search_for(snippet, quads=True)
+                        except TypeError:
+                            hits = page.search_for(snippet)
+                        if hits:
+                            try:
+                                page.add_highlight_annot(hits)
+                            except Exception:
+                                # Fallback: add one highlight per hit
+                                for h in hits:
+                                    try:
+                                        page.add_highlight_annot([h])
+                                    except Exception:
+                                        pass
+                            found_any = True
+                            break
+                    if found_any:
+                        break
+            except Exception:
+                # If highlighting fails, still return a normal rendered page.
+                pass
+
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(1.5, 1.5),
+            annots=True if highlight_texts else False,
+        )
         img_bytes = pix.tobytes("png")
         doc.close()
         return img_bytes
@@ -730,7 +807,8 @@ else:
                             st.markdown(f"**Source {idx+1}** [{src.get('section', '?')}] "
                                         f"p.{src.get('page_numbers', '?')} | "
                                         f"Score: {src.get('score', 0):.3f} | {badge}")
-                            st.caption(src.get("text_preview", "")[:400])
+                            full_text = src.get("text") or src.get("text_preview", "")
+                            st.caption(full_text)
 
                     # PDF Page Viewer
                     if sources and active_pdfs:
@@ -749,7 +827,25 @@ else:
                                 pages = src.get("page_numbers", [])
                                 if pages:
                                     pnum = pages[0] - 1
-                                    img = render_pdf_page(selected_pdf["filepath"], pnum)
+                                    # If the source section is tagged like "[file.pdf] ...",
+                                    # prefer rendering/highlighting against that PDF.
+                                    pdf_for_source = selected_pdf
+                                    sec = (src.get("section") or "").strip()
+                                    if sec.startswith("[") and "]" in sec:
+                                        tagged_name = sec[1:sec.index("]")].strip()
+                                        match = next(
+                                            (p for p in active_pdfs if p.get("filename") == tagged_name),
+                                            None,
+                                        )
+                                        if match and os.path.exists(match.get("filepath", "")):
+                                            pdf_for_source = match
+
+                                    highlight_text = src.get("text") or src.get("text_preview", "")
+                                    img = render_pdf_page(
+                                        pdf_for_source["filepath"],
+                                        pnum,
+                                        highlight_texts=[highlight_text] if highlight_text else None,
+                                    )
                                     if img:
                                         st.image(img,
                                                  caption=f"Page {pages[0]} — {src.get('section', '')}",
