@@ -47,8 +47,17 @@ st.markdown("""
     [data-testid="stSidebar"] {
         background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
         border-right: 1px solid rgba(148, 163, 184, 0.18);
+    }
+    /* Prevent a leftover gutter when the sidebar is collapsed */
+    [data-testid="stSidebar"][aria-expanded="true"] {
         min-width: 340px !important;
         max-width: 340px !important;
+    }
+    [data-testid="stSidebar"][aria-expanded="false"] {
+        min-width: 0 !important;
+        max-width: 0 !important;
+        width: 0 !important;
+        border-right: none !important;
     }
     [data-testid="stSidebarCollapsedControl"] {
         display: none !important;
