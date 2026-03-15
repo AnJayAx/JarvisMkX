@@ -154,10 +154,26 @@ st.markdown("""
         /* Allow hover tooltip to overflow */
         overflow: visible !important;
         text-align: left !important;
+        display: flex !important;
+        align-items: center !important;
         justify-content: flex-start !important;
         position: relative !important;
         padding-left: 0 !important;
         padding-right: 0 !important;
+    }
+
+    /* Streamlit often wraps button labels in inner divs/spans; force them left */
+    [data-testid="stSidebar"] [class*="st-key-session_title_"] button > div,
+    [data-testid="stSidebar"] [class*="st-key-session_title_active_"] button > div {
+        flex: 1 1 auto !important;
+        width: 100% !important;
+        text-align: left !important;
+        margin: 0 !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-session_title_"] button div,
+    [data-testid="stSidebar"] [class*="st-key-session_title_active_"] button div {
+        text-align: left !important;
+        justify-content: flex-start !important;
     }
 
     /* Force a true 1-line render even if inner markup wraps */
@@ -573,16 +589,20 @@ def render_pdf_page(filepath, page_num, highlight_texts=None):
 
 def create_confidence_gauge(confidence):
     color = "#4dff88" if confidence > 0.5 else "#ffcc00" if confidence > 0.3 else "#ff4444"
+    value = max(0.0, min(1.0, float(confidence))) * 100
     fig = go.Figure(go.Indicator(
-        mode="gauge+number", value=confidence * 100,
+        mode="gauge+number",
+        value=value,
         title={"text": "Confidence %", "font": {"size": 14}},
+        number={"suffix": "%", "valueformat": ".0f", "font": {"size": 46}},
         gauge={"axis": {"range": [0, 100]}, "bar": {"color": color},
                "bgcolor": "#1e1e2e",
                "steps": [{"range": [0, 30], "color": "#3a1a1a"},
                          {"range": [30, 60], "color": "#3a3a1a"},
                          {"range": [60, 100], "color": "#1a3a1a"}]},
     ))
-    fig.update_layout(height=200, margin=dict(l=20, r=20, t=40, b=10),
+    # Extra right margin prevents the number text from being clipped on narrow layouts.
+    fig.update_layout(height=200, margin=dict(l=10, r=60, t=40, b=10),
                       paper_bgcolor="rgba(0,0,0,0)", font={"color": "#ccc"})
     return fig
 
