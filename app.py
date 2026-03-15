@@ -25,7 +25,7 @@ from database import (
     create_session, get_all_sessions, search_sessions, get_session,
     update_session_title, update_session_settings, delete_session,
     add_message, get_messages, add_pdf, get_active_pdfs, remove_pdf,
-    add_correction, get_corrections, add_feedback, get_feedback_stats,
+    get_corrections,
 )
 from pdf_export import export_chat_to_pdf
 
@@ -764,7 +764,7 @@ def create_answer_word_cloud_data(answer_text):
 # ──────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## 🤖 Jarvis Mk.X")
+    st.markdown("## Jarvis Mk.X")
     st.caption("Smart Research Paper Q&A")
 
     search_query = st.text_input("Search", placeholder="Find a chat...")
@@ -814,9 +814,7 @@ with st.sidebar:
                             st.rerun()
 
     st.divider()
-    stats = get_feedback_stats()
-    if stats["total"] > 0:
-        st.caption(f"👍 {stats['thumbs_up']} | 👎 {stats['thumbs_down']} feedback")
+
 
 
 # ──────────────────────────────────────────────
@@ -824,16 +822,16 @@ with st.sidebar:
 # ──────────────────────────────────────────────
 
 if st.session_state.current_session is None:
-    st.markdown("# 🤖 Jarvis Mk.X")
-    st.markdown("### Smart Research Paper Q&A Chatbot")
+    st.markdown("# Jarvis Mk.X")
+    st.markdown("### Smart Research Paper Chatbot")
     st.markdown("""
     Upload research papers and ask questions. Jarvis uses fine-tuned Mistral 7B
     with hybrid retrieval (Voyage 3 Large + ChromaDB + BM25).
 
-    **Features:** 📄 Up to 3 PDFs | 💬 Persistent memory | 🎚️ Adjustable settings |
-    📊 Rich visualizations | ✏️ Answer correction | 📥 PDF export
+    **Features:** Up to 3 PDFs | Persistent memory | Adjustable settings |
+    Visualizations | Answer correction | PDF export
 
-    👈 Click **New Chat** to start!
+    👉 Click **New Chat** to start!
     """)
 
 else:
@@ -985,33 +983,6 @@ else:
 
             if msg["role"] == "assistant" and msg.get("confidence", 0) > 0:
                 sources = msg.get("sources", [])
-
-                # Feedback + Correction buttons
-                fb1, fb2, fb3, _ = st.columns([1, 1, 1, 6])
-                with fb1:
-                    if st.button("👍", key=f"up_{msg['id']}"):
-                        add_feedback(session_id, msg["id"], "up")
-                        st.toast("Thanks!")
-                with fb2:
-                    if st.button("👎", key=f"dn_{msg['id']}"):
-                        add_feedback(session_id, msg["id"], "down")
-                        st.toast("Noted.")
-                with fb3:
-                    if st.button("✏️ Correct", key=f"cr_{msg['id']}"):
-                        st.session_state[f"correcting_{msg['id']}"] = True
-
-                if st.session_state.get(f"correcting_{msg['id']}", False):
-                    corr = st.text_area("Correct answer:", key=f"ct_{msg['id']}")
-                    if st.button("Submit", key=f"cs_{msg['id']}"):
-                        if corr:
-                            prev = [m for m in messages if m["id"] < msg["id"] and m["role"] == "user"]
-                            user_q = prev[-1]["content"] if prev else ""
-                            add_correction(session_id, user_q, msg["content"], corr)
-                            bot = get_bot()
-                            bot.correct_answer(corr)
-                            st.session_state[f"correcting_{msg['id']}"] = False
-                            st.toast("✅ Correction saved!")
-                            st.rerun()
 
                 # ─── VISUALIZATIONS ───
                 with st.expander("📊 Answer Analytics", expanded=False):
