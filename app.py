@@ -10,6 +10,7 @@ import sys
 import os
 import time
 import json
+import re
 import fitz
 import plotly.express as px
 import plotly.graph_objects as go
@@ -39,7 +40,160 @@ st.set_page_config(
 # ─── CSS ───
 st.markdown("""
 <style>
-    .stApp { font-family: 'Segoe UI', sans-serif; }
+    .stApp { 
+        font-family: 'Segoe UI', sans-serif;
+        background: radial-gradient(circle at 20% 5%, #1b2433 0%, #0d1117 40%, #0a0f14 100%);
+    }
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
+        border-right: 1px solid rgba(148, 163, 184, 0.18);
+        min-width: 340px !important;
+        max-width: 340px !important;
+    }
+    [data-testid="stSidebarCollapsedControl"] {
+        display: none !important;
+    }
+    [data-testid="stSidebarResizer"] {
+        display: none !important;
+    }
+    [data-testid="stSidebar"] [data-testid="stMarkdownContainer"] h2 {
+        letter-spacing: 0.2px;
+        font-weight: 700;
+    }
+    [data-testid="stSidebar"] .stTextInput input {
+        background-color: rgba(148, 163, 184, 0.12);
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 12px;
+        color: #e2e8f0;
+    }
+    [data-testid="stSidebar"] .stTextInput input:focus {
+        border-color: #60a5fa;
+        box-shadow: 0 0 0 1px #60a5fa;
+    }
+    [data-testid="stSidebar"] .stButton > button {
+        border-radius: 12px;
+        border: 1px solid rgba(148, 163, 184, 0.3);
+        background: rgba(148, 163, 184, 0.08);
+        color: #e2e8f0;
+        transition: all 0.15s ease;
+    }
+    [data-testid="stSidebar"] .stButton > button:hover {
+        border-color: rgba(96, 165, 250, 0.85);
+        background: rgba(96, 165, 250, 0.15);
+        transform: translateY(-1px);
+    }
+    [data-testid="stSidebar"] .stButton > button[kind="primary"] {
+        background: linear-gradient(90deg, #2563eb 0%, #1d4ed8 100%);
+        border-color: rgba(96, 165, 250, 0.9);
+        color: #f8fafc;
+        font-weight: 600;
+    }
+    [data-testid="stSidebar"] .stButton > button[kind="secondary"] {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+    }
+    [data-testid="stSidebar"] .stButton > button[kind="secondary"] p {
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-session_title_"] .stButton > button {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: #d1d5db !important;
+        border-radius: 0 !important;
+        display: flex !important;
+        justify-content: flex-start !important;
+        align-items: center !important;
+        text-align: left !important;
+        width: 100% !important;
+        min-height: 2rem !important;
+        /* Let the tooltip overflow the button; ellipsis is applied to the inner text element */
+        overflow: visible !important;
+        transform: none !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-session_title_"] .stButton > button:hover {
+        background: transparent !important;
+        color: #e5e7eb !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-session_title_"] .stButton > button p {
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        margin: 0 !important;
+        width: 100%;
+        text-align: left !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-session_title_"] .stButton > button * {
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        text-align: left !important;
+    }
+
+    /* Fallback selectors (Streamlit markup varies by version) */
+    [data-testid="stSidebar"] [class*="st-key-session_title_"] button,
+    [data-testid="stSidebar"] [class*="st-key-session_title_active_"] button {
+        /* Remove the “boxed button” look */
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        /* Allow hover tooltip to overflow */
+        overflow: visible !important;
+        text-align: left !important;
+        justify-content: flex-start !important;
+        position: relative !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+    }
+
+    /* Force a true 1-line render even if inner markup wraps */
+    [data-testid="stSidebar"] [class*="st-key-session_title_"] button p,
+    [data-testid="stSidebar"] [class*="st-key-session_title_active_"] button p,
+    [data-testid="stSidebar"] [class*="st-key-session_title_"] button span,
+    [data-testid="stSidebar"] [class*="st-key-session_title_active_"] button span {
+        white-space: nowrap !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        max-width: 100% !important;
+    }
+
+    /* Full title on hover is handled by the browser's native tooltip via the button's `title`
+       attribute (Streamlit sets this from `help=`). */
+    [data-testid="stSidebar"] [class*="st-key-session_title_active_"] .stButton > button {
+        color: #bfdbfe !important;
+        font-weight: 700 !important;
+    }
+
+    /* Active session highlight (robust across Streamlit DOM variations) */
+    [data-testid="stSidebar"] [class*="st-key-session_title_active_"] {
+        border-left: 3px solid rgba(96, 165, 250, 0.85) !important;
+        padding-left: 0.55rem !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-session_title_active_"] button {
+        color: #bfdbfe !important;
+        font-weight: 700 !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-session_delete_"] .stButton > button {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: #9ca3af !important;
+        width: 100% !important;
+        min-width: 100% !important;
+        justify-content: flex-end !important;
+        padding-left: 0 !important;
+        padding-right: 0.1rem !important;
+        transform: none !important;
+    }
+    [data-testid="stSidebar"] [class*="st-key-session_delete_"] .stButton > button:hover {
+        background: transparent !important;
+        color: #f87171 !important;
+    }
     .chat-user { background: #1e3a5f; padding: 12px 16px; border-radius: 12px;
                  margin: 4px 0; border-left: 3px solid #4da6ff; }
     .chat-bot { background: #1a3328; padding: 12px 16px; border-radius: 12px;
@@ -194,6 +348,129 @@ def _normalize_pdf_search_text(text: str) -> str:
     return " ".join(str(text).replace("\u00ad", "").split())
 
 
+def _normalize_token(token: str) -> str:
+    token = (token or "").lower()
+    # Keep alphanumerics; drop punctuation to be resilient to PDF quirks.
+    token = re.sub(r"[^a-z0-9]+", "", token)
+    return token
+
+
+def _first_sentence(text: str, max_chars: int = 260) -> str:
+    """Return a short, sentence-like snippet to highlight.
+
+    Highlighting entire chunks is brittle (columns, hyphenation, line wraps).
+    A short snippet greatly increases match reliability.
+    """
+    t = _normalize_pdf_search_text(text)
+    if not t:
+        return ""
+    # Try to cut at sentence boundary.
+    m = re.search(r"(.+?[.!?])\s", t)
+    if m:
+        snippet = m.group(1)
+    else:
+        snippet = t
+    return snippet[:max_chars].strip()
+
+
+def _rect_union(rects):
+    if not rects:
+        return None
+    r = fitz.Rect(rects[0])
+    for rr in rects[1:]:
+        r |= fitz.Rect(rr)
+    return r
+
+
+def _find_highlight_rects_by_words(page, text: str, max_words: int = 35):
+    """Best-effort mapping from passage text -> highlight rectangles.
+
+    Uses word-level coordinates rather than string search to reduce drift.
+    Returns a list of fitz.Rect (usually one per line).
+    """
+    snippet = _first_sentence(text)
+    if not snippet:
+        return []
+
+    target_tokens = [_normalize_token(t) for t in snippet.split()]
+    target_tokens = [t for t in target_tokens if t]
+    if not target_tokens:
+        return []
+    target_tokens = target_tokens[:max_words]
+
+    words = page.get_text("words") or []
+    if not words:
+        return []
+
+    page_tokens = []
+    for w in words:
+        tok = _normalize_token(w[4])
+        page_tokens.append(tok)
+
+    # Anchor match on first N tokens.
+    anchor_len = min(8, len(target_tokens))
+    anchor = target_tokens[:anchor_len]
+    if anchor_len < 3:
+        return []
+
+    candidate_starts = []
+    for i in range(0, len(page_tokens) - anchor_len + 1):
+        if page_tokens[i:i + anchor_len] == anchor:
+            candidate_starts.append(i)
+            if len(candidate_starts) >= 5:
+                break
+
+    # If no exact anchor match, give up (caller can fall back to search_for).
+    if not candidate_starts:
+        return []
+
+    # Pick the start that yields the longest forward match.
+    best = None
+    best_len = 0
+    for start in candidate_starts:
+        j = 0
+        while (start + j) < len(page_tokens) and j < len(target_tokens):
+            if page_tokens[start + j] != target_tokens[j]:
+                break
+            j += 1
+        if j > best_len:
+            best_len = j
+            best = (start, j)
+
+    if not best or best_len < 4:
+        return []
+
+    start, length = best
+    matched_words = words[start:start + length]
+    # Group into line-ish rectangles by y coordinate.
+    line_groups = []
+    current = []
+    current_y = None
+
+    for w in matched_words:
+        rect = fitz.Rect(w[0], w[1], w[2], w[3])
+        y = round(rect.y0, 1)
+        if current_y is None:
+            current_y = y
+            current.append(rect)
+            continue
+        if abs(y - current_y) <= 2.5:
+            current.append(rect)
+        else:
+            line_groups.append(current)
+            current = [rect]
+            current_y = y
+    if current:
+        line_groups.append(current)
+
+    rects = []
+    for group in line_groups:
+        u = _rect_union(group)
+        if u:
+            rects.append(u)
+    return rects
+
+
 def _build_search_snippets(text: str) -> list:
     """Build short snippets likely to match PDF text extraction."""
     t = _normalize_pdf_search_text(text)
@@ -238,6 +515,17 @@ def render_pdf_page(filepath, page_num, highlight_texts=None):
         if highlight_texts:
             try:
                 for text in highlight_texts:
+                    # 1) Try coordinate-aware matching via words
+                    rects = _find_highlight_rects_by_words(page, text)
+                    if rects:
+                        for r in rects:
+                            try:
+                                page.add_highlight_annot(r)
+                            except Exception:
+                                pass
+                        break
+
+                    # 2) Fallback: plain text search
                     found_any = False
                     for snippet in _build_search_snippets(text):
                         try:
@@ -248,7 +536,6 @@ def render_pdf_page(filepath, page_num, highlight_texts=None):
                             try:
                                 page.add_highlight_annot(hits)
                             except Exception:
-                                # Fallback: add one highlight per hit
                                 for h in hits:
                                     try:
                                         page.add_highlight_annot([h])
@@ -480,9 +767,9 @@ with st.sidebar:
     st.markdown("## 🤖 Jarvis Mk.X")
     st.caption("Smart Research Paper Q&A")
 
-    search_query = st.text_input("🔍 Search conversations", placeholder="Filter by keyword...")
+    search_query = st.text_input("Search", placeholder="Find a chat...")
 
-    if st.button("➕ New Chat", use_container_width=True, type="primary"):
+    if st.button("+ New Chat", use_container_width=True, type="primary"):
         sid = create_session("New Chat")
         st.session_state.current_session = sid
         st.session_state.papers_loaded_key = None
@@ -496,38 +783,40 @@ with st.sidebar:
     if not sessions:
         st.info("No chats yet. Click 'New Chat'!")
     else:
-        for sess in sessions:
-            c1, c2 = st.columns([5, 1])
-            with c1:
-                is_active = st.session_state.current_session == sess["id"]
-                if st.button(f"💬 {sess['title']}", key=f"s_{sess['id']}",
-                             use_container_width=True,
-                             type="primary" if is_active else "secondary"):
-                    st.session_state.current_session = sess["id"]
-                    st.session_state.papers_loaded_key = None
-                    st.session_state.suggested_questions = []
-                    st.rerun()
-            with c2:
-                if st.button("🗑️", key=f"d_{sess['id']}"):
-                    delete_session(sess["id"])
-                    if st.session_state.current_session == sess["id"]:
-                        st.session_state.current_session = None
-                    st.rerun()
+        with st.container(key="session_list"):
+            for sess in sessions:
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    is_active = st.session_state.current_session == sess["id"]
+                    full_title = sess["title"]
+                    # Render the full title; CSS enforces a 1-line ellipsis.
+                    # Keeping the full text in the DOM ensures hover tooltips can show the whole title.
+                    display_title = full_title
+                    title_container_key = (
+                        f"session_title_active_{sess['id']}"
+                        if is_active else f"session_title_{sess['id']}"
+                    )
+                    with st.container(key=title_container_key):
+                        if st.button(display_title, key=f"s_{sess['id']}",
+                                     use_container_width=True,
+                                     help=full_title,
+                                     type="secondary"):
+                            st.session_state.current_session = sess["id"]
+                            st.session_state.papers_loaded_key = None
+                            st.session_state.suggested_questions = []
+                            st.rerun()
+                with c2:
+                    with st.container(key=f"session_delete_{sess['id']}"):
+                        if st.button("🗑️", key=f"d_{sess['id']}", use_container_width=True):
+                            delete_session(sess["id"])
+                            if st.session_state.current_session == sess["id"]:
+                                st.session_state.current_session = None
+                            st.rerun()
 
     st.divider()
     stats = get_feedback_stats()
     if stats["total"] > 0:
         st.caption(f"👍 {stats['thumbs_up']} | 👎 {stats['thumbs_down']} feedback")
-
-    st.divider()
-    theme = st.selectbox("🎨 Theme", ["Dark", "Light"], index=0)
-    if theme == "Light":
-        st.markdown("""<style>
-            .stApp { background-color: #f5f5f5; color: #333; }
-            .chat-user { background: #e3f0ff; border-left-color: #2196F3; color: #333; }
-            .chat-bot { background: #e8f5e9; border-left-color: #4CAF50; color: #333; }
-            .pdf-summary { background: #f0f0f8; border-color: #ccc; color: #333; }
-        </style>""", unsafe_allow_html=True)
 
 
 # ──────────────────────────────────────────────
@@ -539,7 +828,7 @@ if st.session_state.current_session is None:
     st.markdown("### Smart Research Paper Q&A Chatbot")
     st.markdown("""
     Upload research papers and ask questions. Jarvis uses fine-tuned Mistral 7B
-    with hybrid retrieval (SPECTER + ChromaDB + BM25).
+    with hybrid retrieval (Voyage 3 Large + ChromaDB + BM25).
 
     **Features:** 📄 Up to 3 PDFs | 💬 Persistent memory | 🎚️ Adjustable settings |
     📊 Rich visualizations | ✏️ Answer correction | 📥 PDF export
@@ -580,7 +869,9 @@ else:
     with c2:
         top_k = st.slider("🔍 Top-K", 1, 10, session.get("top_k", 5),
                            help="Chunks to retrieve")
-    update_session_settings(session_id, leniency, top_k)
+    # Avoid updating `updated_at` (and reordering sidebar sessions) unless settings actually changed.
+    if (leniency != session.get("leniency", 50)) or (top_k != session.get("top_k", 5)):
+        update_session_settings(session_id, leniency, top_k)
 
     # ─── PDF Upload ───
     st.markdown("---")

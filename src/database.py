@@ -149,8 +149,10 @@ def update_session_title(session_id: str, title: str):
 def update_session_settings(session_id: str, leniency: int, top_k: int):
     conn = get_connection()
     conn.execute(
-        "UPDATE sessions SET leniency = ?, top_k = ?, updated_at = ? WHERE id = ?",
-        (leniency, top_k, datetime.now().isoformat(), session_id),
+        """UPDATE sessions
+           SET leniency = ?, top_k = ?, updated_at = ?
+           WHERE id = ? AND (leniency != ? OR top_k != ?)""",
+        (leniency, top_k, datetime.now().isoformat(), session_id, leniency, top_k),
     )
     conn.commit()
     conn.close()
