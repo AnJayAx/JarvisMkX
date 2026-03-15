@@ -227,6 +227,38 @@ st.markdown("""
                    margin: 6px 0; border: 1px solid #444; }
     .stat-card { background: #1e1e2e; padding: 10px 14px; border-radius: 8px;
                  text-align: center; border: 1px solid #333; }
+
+    /* Sticky composer (prompt + settings)
+       NOTE: Streamlit's DOM varies by version; target the keyed container directly. */
+    section.main {
+        /* Prevent chat messages from being hidden behind the fixed composer */
+        padding-bottom: 320px !important;
+    }
+    .st-key-composer {
+        position: fixed !important;
+        bottom: 0 !important;
+        right: 0 !important;
+        left: 0 !important;
+        z-index: 999 !important;
+        box-sizing: border-box !important;
+        width: auto !important;
+        max-width: none !important;
+        padding: 0.9rem 1.1rem 1.1rem 1.1rem !important;
+        background: rgba(13, 17, 23, 0.88) !important;
+        backdrop-filter: blur(10px) !important;
+        border-top: 1px solid rgba(148, 163, 184, 0.18) !important;
+    }
+    /* Align composer with main area when sidebar is expanded.
+       `:has()` is supported in modern Chromium and is much more reliable than sibling selectors
+       across Streamlit DOM variations. */
+    body:has([data-testid="stSidebar"][aria-expanded="true"]) .st-key-composer {
+        left: 340px !important;
+        width: calc(100% - 340px) !important;
+    }
+    body:has([data-testid="stSidebar"][aria-expanded="false"]) .st-key-composer {
+        left: 0 !important;
+        width: 100% !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -888,18 +920,6 @@ else:
                                        file_name=os.path.basename(path),
                                        mime="application/pdf")
 
-    # ─── Settings ───
-    c1, c2 = st.columns(2)
-    with c1:
-        leniency = st.slider("🎚️ Leniency", 0, 100, session.get("leniency", 50),
-                              help="0=strict, 100=lenient")
-    with c2:
-        top_k = st.slider("🔍 Top-K", 1, 10, session.get("top_k", 5),
-                           help="Chunks to retrieve")
-    # Avoid updating `updated_at` (and reordering sidebar sessions) unless settings actually changed.
-    if (leniency != session.get("leniency", 50)) or (top_k != session.get("top_k", 5)):
-        update_session_settings(session_id, leniency, top_k)
-
     # ─── PDF Upload ───
     st.markdown("---")
     active_pdfs = get_active_pdfs(session_id)
@@ -1143,10 +1163,57 @@ else:
                                                  width=550)
                                     break
 
-    # ─── Chat Input ───
+    # ─── Sticky Composer (Prompt + Settings) ───
     pending = st.session_state.pop("pending_question", None)
-    prompt = st.chat_input("Ask about your research papers...") or pending
 
+    # If a suggested question was clicked, prefill the input.
+    prompt_key = f"prompt_{session_id}"
+    if pending:
+        st.session_state[prompt_key] = pending
+
+    with st.container(key="composer"):
+        with st.form(key=f"composer_form_{session_id}", clear_on_submit=True):
+            prompt_text = st.text_input(
+                "Ask about your research papers...",
+                key=prompt_key,
+                label_visibility="collapsed",
+                placeholder="Ask about your research papers...",
+            )
+
+            c1, c2 = st.columns(2)
+            with c1:
+                leniency = st.slider(
+                    "🎚️ Leniency",
+                    0,
+                    100,
+                    int(session.get("leniency", 50)),
+                    help="0=strict, 100=lenient",
+                    key=f"leniency_{session_id}",
+                )
+            with c2:
+                top_k = st.slider(
+                    "🔍 Top-K",
+                    1,
+                    10,
+                    int(session.get("top_k", 5)),
+                    help="Chunks to retrieve",
+                    key=f"topk_{session_id}",
+                )
+
+            sent = st.form_submit_button("Send")
+
+    # Avoid updating `updated_at` (and reordering sidebar sessions) unless settings actually changed.
+    if (leniency != session.get("leniency", 50)) or (top_k != session.get("top_k", 5)):
+        update_session_settings(session_id, leniency, top_k)
+
+    if sent:
+        prompt = (prompt_text or "").strip()
+    elif pending:
+        # Preserve the old behavior: suggested questions send immediately.
+        prompt = (pending or "").strip()
+        st.session_state[prompt_key] = ""
+    else:
+        prompt = None
     if prompt:
         if not active_pdfs:
             st.warning("📄 Upload a PDF first!")
@@ -1164,11 +1231,15 @@ else:
                 sources_data = format_sources_for_db(response.sources)
                 methods = list(set(getattr(s, "retrieval_method", "?") for s in response.sources))
 
-                add_message(session_id, "assistant", response.answer,
-                            confidence=response.confidence,
-                            generation_time=response.generation_time,
-                            sources=sources_data,
-                            retrieval_methods=", ".join(methods))
+                add_message(
+                    session_id,
+                    "assistant",
+                    response.answer,
+                    confidence=response.confidence,
+                    generation_time=response.generation_time,
+                    sources=sources_data,
+                    retrieval_methods=", ".join(methods),
+                )
 
             if len(get_messages(session_id)) <= 2:
                 update_session_title(session_id, prompt[:50] + ("..." if len(prompt) > 50 else ""))
