@@ -749,7 +749,7 @@ def create_answer_word_cloud_data(answer_text):
 
 with st.sidebar:
     st.markdown("## Jarvis Mk.X")
-    st.caption("Smart Research Paper Q&A")
+    st.caption("Smart Research Paper Chatbot")
 
     search_query = st.text_input("Search", placeholder="Find a chat...")
 
