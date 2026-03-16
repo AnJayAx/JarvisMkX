@@ -6,6 +6,7 @@ Run: streamlit run app.py
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import sys
 import os
 import time
@@ -29,7 +30,6 @@ from database import (
 )
 from pdf_export import export_chat_to_pdf
 
-# ─── Page Config ───
 st.set_page_config(
     page_title="Jarvis Mk.X",
     page_icon="🤖",
@@ -37,9 +37,11 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ─── CSS ───
 st.markdown("""
 <style>
+    :root {
+        --composer-height: 260px;
+    }
     .stApp { 
         font-family: 'Segoe UI', sans-serif;
         background: radial-gradient(circle at 20% 5%, #1b2433 0%, #0d1117 40%, #0a0f14 100%);
@@ -48,7 +50,6 @@ st.markdown("""
         background: linear-gradient(180deg, #111827 0%, #0f172a 100%);
         border-right: 1px solid rgba(148, 163, 184, 0.18);
     }
-    /* Prevent a leftover gutter when the sidebar is collapsed */
     [data-testid="stSidebar"][aria-expanded="true"] {
         min-width: 340px !important;
         max-width: 340px !important;
@@ -119,7 +120,6 @@ st.markdown("""
         text-align: left !important;
         width: 100% !important;
         min-height: 2rem !important;
-        /* Let the tooltip overflow the button; ellipsis is applied to the inner text element */
         overflow: visible !important;
         transform: none !important;
         padding-left: 0 !important;
@@ -143,15 +143,11 @@ st.markdown("""
         text-overflow: ellipsis !important;
         text-align: left !important;
     }
-
-    /* Fallback selectors (Streamlit markup varies by version) */
     [data-testid="stSidebar"] [class*="st-key-session_title_"] button,
     [data-testid="stSidebar"] [class*="st-key-session_title_active_"] button {
-        /* Remove the “boxed button” look */
         background: transparent !important;
         border: none !important;
         box-shadow: none !important;
-        /* Allow hover tooltip to overflow */
         overflow: visible !important;
         text-align: left !important;
         display: flex !important;
@@ -161,8 +157,6 @@ st.markdown("""
         padding-left: 0 !important;
         padding-right: 0 !important;
     }
-
-    /* Streamlit often wraps button labels in inner divs/spans; force them left */
     [data-testid="stSidebar"] [class*="st-key-session_title_"] button > div,
     [data-testid="stSidebar"] [class*="st-key-session_title_active_"] button > div {
         flex: 1 1 auto !important;
@@ -175,8 +169,6 @@ st.markdown("""
         text-align: left !important;
         justify-content: flex-start !important;
     }
-
-    /* Force a true 1-line render even if inner markup wraps */
     [data-testid="stSidebar"] [class*="st-key-session_title_"] button p,
     [data-testid="stSidebar"] [class*="st-key-session_title_active_"] button p,
     [data-testid="stSidebar"] [class*="st-key-session_title_"] button span,
@@ -186,15 +178,10 @@ st.markdown("""
         text-overflow: ellipsis !important;
         max-width: 100% !important;
     }
-
-    /* Full title on hover is handled by the browser's native tooltip via the button's `title`
-       attribute (Streamlit sets this from `help=`). */
     [data-testid="stSidebar"] [class*="st-key-session_title_active_"] .stButton > button {
         color: #bfdbfe !important;
         font-weight: 700 !important;
     }
-
-    /* Active session highlight (robust across Streamlit DOM variations) */
     [data-testid="stSidebar"] [class*="st-key-session_title_active_"] {
         border-left: 3px solid rgba(96, 165, 250, 0.85) !important;
         padding-left: 0.55rem !important;
@@ -228,12 +215,10 @@ st.markdown("""
     .stat-card { background: #1e1e2e; padding: 10px 14px; border-radius: 8px;
                  text-align: center; border: 1px solid #333; }
 
-    /* Sticky composer (prompt + settings)
-       NOTE: Streamlit's DOM varies by version; target the keyed container directly. */
-    section.main {
-        /* Prevent chat messages from being hidden behind the fixed composer */
-        padding-bottom: 320px !important;
+    [data-testid="stMainBlockContainer"], .main .block-container {
+        padding-bottom: calc(var(--composer-height, 260px)) !important;
     }
+
     .st-key-composer {
         position: fixed !important;
         bottom: 0 !important;
@@ -248,9 +233,7 @@ st.markdown("""
         backdrop-filter: blur(10px) !important;
         border-top: 1px solid rgba(148, 163, 184, 0.18) !important;
     }
-    /* Align composer with main area when sidebar is expanded.
-       `:has()` is supported in modern Chromium and is much more reliable than sibling selectors
-       across Streamlit DOM variations. */
+
     body:has([data-testid="stSidebar"][aria-expanded="true"]) .st-key-composer {
         left: 340px !important;
         width: calc(100% - 340px) !important;
@@ -263,7 +246,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ─── Session State ───
 def init_state():
     defaults = {
         "current_session": None,
@@ -280,14 +262,9 @@ def init_state():
 init_state()
 
 
-# ─── Bot Loading ───
 @st.cache_resource(show_spinner=False)
 def load_bot():
     from bot import JarvisBot
-
-    # Embeddings selection:
-    # - Set JARVIS_EMBED_MODEL to force a specific backend (e.g., "voyage-3-large").
-    # - Otherwise, use Voyage only when VOYAGE_API_KEY is configured.
     forced_embed_model = os.environ.get("JARVIS_EMBED_MODEL", "").strip()
     if forced_embed_model:
         embed_model_name = forced_embed_model
@@ -316,15 +293,13 @@ def get_bot():
     return st.session_state.bot
 
 
-# ─── Multi-PDF Loading ───
 def load_all_pdfs_into_bot(session_id, active_pdfs, messages):
-    """Load all active PDFs by combining their chunks into one index."""
     if not active_pdfs:
         return
 
     cache_key = f"{session_id}_{'_'.join(p['id'] for p in active_pdfs)}"
     if st.session_state.papers_loaded_key == cache_key:
-        return  # Already loaded this exact combination
+        return
 
     bot = get_bot()
     from processor import PaperProcessor
@@ -335,18 +310,15 @@ def load_all_pdfs_into_bot(session_id, active_pdfs, messages):
     for pdf in active_pdfs:
         if os.path.exists(pdf["filepath"]):
             paper = processor.process(pdf["filepath"])
-            # Tag chunks with source PDF name
             for chunk in paper.chunks:
                 chunk.section = f"[{pdf['filename']}] {chunk.section}"
             all_chunks.extend(paper.chunks)
-            # Keep the last paper's metadata for meta questions
             bot.current_paper = paper
 
     if all_chunks:
         bot.retriever.build_index(all_chunks)
         st.session_state.all_chunks_cache = all_chunks
 
-    # Reload conversation history
     from bot import ConversationTurn
     bot.conversation_history = []
     for msg in messages:
@@ -357,7 +329,6 @@ def load_all_pdfs_into_bot(session_id, active_pdfs, messages):
     if len(bot.conversation_history) > bot.max_history_turns:
         bot.conversation_history = bot.conversation_history[-bot.max_history_turns:]
 
-    # Reload corrections
     corrections = get_corrections(session_id)
     bot.corrections = [
         {"question": c["question"], "wrong_answer": c["wrong_answer"],
@@ -367,8 +338,6 @@ def load_all_pdfs_into_bot(session_id, active_pdfs, messages):
 
     st.session_state.papers_loaded_key = cache_key
 
-
-# ─── Helpers ───
 
 def generate_suggested_questions(paper_info):
     sections = paper_info.get("sections", [])
@@ -390,8 +359,6 @@ def format_sources_for_db(sources):
         {"section": s.section, "page_numbers": s.page_numbers,
          "score": round(s.score, 4),
          "method": getattr(s, "retrieval_method", "unknown"),
-         # Store full text so the analytics panel can show complete passages.
-         # Keep a short preview for charts / lightweight displays.
          "text": s.text,
          "text_preview": s.text[:300]}
         for s in sources
@@ -401,27 +368,19 @@ def format_sources_for_db(sources):
 def _normalize_pdf_search_text(text: str) -> str:
     if not text:
         return ""
-    # PDFs may contain line breaks/hyphenation; collapse whitespace for matching.
     return " ".join(str(text).replace("\u00ad", "").split())
 
 
 def _normalize_token(token: str) -> str:
     token = (token or "").lower()
-    # Keep alphanumerics; drop punctuation to be resilient to PDF quirks.
     token = re.sub(r"[^a-z0-9]+", "", token)
     return token
 
 
 def _first_sentence(text: str, max_chars: int = 260) -> str:
-    """Return a short, sentence-like snippet to highlight.
-
-    Highlighting entire chunks is brittle (columns, hyphenation, line wraps).
-    A short snippet greatly increases match reliability.
-    """
     t = _normalize_pdf_search_text(text)
     if not t:
         return ""
-    # Try to cut at sentence boundary.
     m = re.search(r"(.+?[.!?])\s", t)
     if m:
         snippet = m.group(1)
@@ -440,11 +399,6 @@ def _rect_union(rects):
 
 
 def _find_highlight_rects_by_words(page, text: str, max_words: int = 35):
-    """Best-effort mapping from passage text -> highlight rectangles.
-
-    Uses word-level coordinates rather than string search to reduce drift.
-    Returns a list of fitz.Rect (usually one per line).
-    """
     snippet = _first_sentence(text)
     if not snippet:
         return []
@@ -464,7 +418,6 @@ def _find_highlight_rects_by_words(page, text: str, max_words: int = 35):
         tok = _normalize_token(w[4])
         page_tokens.append(tok)
 
-    # Anchor match on first N tokens.
     anchor_len = min(8, len(target_tokens))
     anchor = target_tokens[:anchor_len]
     if anchor_len < 3:
@@ -477,11 +430,9 @@ def _find_highlight_rects_by_words(page, text: str, max_words: int = 35):
             if len(candidate_starts) >= 5:
                 break
 
-    # If no exact anchor match, give up (caller can fall back to search_for).
     if not candidate_starts:
         return []
 
-    # Pick the start that yields the longest forward match.
     best = None
     best_len = 0
     for start in candidate_starts:
@@ -499,7 +450,6 @@ def _find_highlight_rects_by_words(page, text: str, max_words: int = 35):
 
     start, length = best
     matched_words = words[start:start + length]
-    # Group into line-ish rectangles by y coordinate.
     line_groups = []
     current = []
     current_y = None
@@ -529,7 +479,6 @@ def _find_highlight_rects_by_words(page, text: str, max_words: int = 35):
 
 
 def _build_search_snippets(text: str) -> list:
-    """Build short snippets likely to match PDF text extraction."""
     t = _normalize_pdf_search_text(text)
     if not t:
         return []
@@ -537,7 +486,6 @@ def _build_search_snippets(text: str) -> list:
     words = t.split()
     snippets = []
 
-    # Prefer word-based snippets (more stable than raw character slices).
     if len(words) >= 6:
         snippets.append(" ".join(words[:12]))
     if len(words) >= 24:
@@ -546,10 +494,8 @@ def _build_search_snippets(text: str) -> list:
     if len(words) >= 12:
         snippets.append(" ".join(words[-12:]))
 
-    # Fallback: first ~120 characters.
     snippets.append(t[:120])
 
-    # De-dupe + drop very short snippets.
     seen = set()
     out = []
     for s in snippets:
@@ -568,11 +514,9 @@ def render_pdf_page(filepath, page_num, highlight_texts=None):
         doc = fitz.open(filepath)
         page = doc[min(page_num, len(doc) - 1)]
 
-        # Best-effort highlighting: search for snippets of the retrieved passage.
         if highlight_texts:
             try:
                 for text in highlight_texts:
-                    # 1) Try coordinate-aware matching via words
                     rects = _find_highlight_rects_by_words(page, text)
                     if rects:
                         for r in rects:
@@ -582,7 +526,6 @@ def render_pdf_page(filepath, page_num, highlight_texts=None):
                                 pass
                         break
 
-                    # 2) Fallback: plain text search
                     found_any = False
                     for snippet in _build_search_snippets(text):
                         try:
@@ -603,7 +546,6 @@ def render_pdf_page(filepath, page_num, highlight_texts=None):
                     if found_any:
                         break
             except Exception:
-                # If highlighting fails, still return a normal rendered page.
                 pass
 
         pix = page.get_pixmap(
@@ -616,8 +558,6 @@ def render_pdf_page(filepath, page_num, highlight_texts=None):
     except:
         return None
 
-
-# ─── Visualization Functions ───
 
 def create_confidence_gauge(confidence):
     color = "#4dff88" if confidence > 0.5 else "#ffcc00" if confidence > 0.3 else "#ff4444"
@@ -633,7 +573,6 @@ def create_confidence_gauge(confidence):
                          {"range": [30, 60], "color": "#3a3a1a"},
                          {"range": [60, 100], "color": "#1a3a1a"}]},
     ))
-    # Extra right margin prevents the number text from being clipped on narrow layouts.
     fig.update_layout(height=200, margin=dict(l=10, r=60, t=40, b=10),
                       paper_bgcolor="rgba(0,0,0,0)", font={"color": "#ccc"})
     return fig
@@ -659,7 +598,6 @@ def create_source_chart(sources):
 
 
 def create_method_pie(sources):
-    """Pie chart of retrieval methods used."""
     if not sources: return None
     methods = [s.get("method", "unknown") for s in sources]
     from collections import Counter
@@ -677,23 +615,19 @@ def create_method_pie(sources):
 
 
 def create_3d_vector_space(query_text, sources, embed_model):
-    """3D UMAP/PCA projection of query vs retrieved chunks."""
     if not sources or len(sources) < 2:
         return None
 
     try:
         from sklearn.decomposition import PCA
 
-        # Collect texts
         texts = [query_text] + [s.get("text_preview", "")[:200] for s in sources]
         labels = ["Query"] + [f"Chunk {i+1}: {s.get('section', '?')[:20]}" for i, s in enumerate(sources)]
         types = ["query"] + ["chunk"] * len(sources)
         scores = [1.0] + [s.get("score", 0) for s in sources]
 
-        # Embed
         embeddings = embed_model.encode(texts, normalize_embeddings=True)
 
-        # PCA to 3D
         pca = PCA(n_components=3)
         coords = pca.fit_transform(embeddings)
 
@@ -703,7 +637,6 @@ def create_3d_vector_space(query_text, sources, embed_model):
 
         fig = go.Figure()
 
-        # Chunks
         for i in range(1, len(coords)):
             fig.add_trace(go.Scatter3d(
                 x=[coords[i, 0]], y=[coords[i, 1]], z=[coords[i, 2]],
@@ -712,7 +645,6 @@ def create_3d_vector_space(query_text, sources, embed_model):
                 marker=dict(size=sizes[i], color=colors[i], opacity=0.8),
                 name=labels[i],
             ))
-            # Line from query to chunk
             fig.add_trace(go.Scatter3d(
                 x=[coords[0, 0], coords[i, 0]],
                 y=[coords[0, 1], coords[i, 1]],
@@ -722,7 +654,6 @@ def create_3d_vector_space(query_text, sources, embed_model):
                 showlegend=False, opacity=0.4,
             ))
 
-        # Query point (larger, red)
         fig.add_trace(go.Scatter3d(
             x=[coords[0, 0]], y=[coords[0, 1]], z=[coords[0, 2]],
             mode="markers+text", text=["YOUR QUERY"],
@@ -749,13 +680,11 @@ def create_3d_vector_space(query_text, sources, embed_model):
 
 
 def create_score_heatmap(sources):
-    """Heatmap showing dense vs sparse scores for each source."""
     if not sources or len(sources) < 2: return None
 
     sections = [s.get("section", "?")[:25] for s in sources]
     hybrid = [s.get("score", 0) for s in sources]
 
-    # Estimate dense/sparse split from method
     dense_est = []
     sparse_est = []
     for s in sources:
@@ -786,7 +715,6 @@ def create_score_heatmap(sources):
 
 
 def create_chunk_length_chart(sources):
-    """Bar chart showing text length of each retrieved chunk."""
     if not sources: return None
     sections = [f"Chunk {i+1}" for i in range(len(sources))]
     lengths = [len(s.get("text_preview", "")) for s in sources]
@@ -800,7 +728,6 @@ def create_chunk_length_chart(sources):
 
 
 def create_answer_word_cloud_data(answer_text):
-    """Simple word frequency bar chart (pseudo word-cloud)."""
     import re
     from collections import Counter
     words = re.findall(r'\b[a-zA-Z]{4,}\b', answer_text.lower())
@@ -819,10 +746,6 @@ def create_answer_word_cloud_data(answer_text):
                       font={"color": "#ccc"})
     return fig
 
-
-# ──────────────────────────────────────────────
-#                  SIDEBAR
-# ──────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown("## Jarvis Mk.X")
@@ -850,8 +773,6 @@ with st.sidebar:
                 with c1:
                     is_active = st.session_state.current_session == sess["id"]
                     full_title = sess["title"]
-                    # Render the full title; CSS enforces a 1-line ellipsis.
-                    # Keeping the full text in the DOM ensures hover tooltips can show the whole title.
                     display_title = full_title
                     title_container_key = (
                         f"session_title_active_{sess['id']}"
@@ -877,11 +798,6 @@ with st.sidebar:
     st.divider()
 
 
-
-# ──────────────────────────────────────────────
-#                  MAIN AREA
-# ──────────────────────────────────────────────
-
 if st.session_state.current_session is None:
     st.markdown("# Jarvis Mk.X")
     st.markdown("### Smart Research Paper Chatbot")
@@ -903,7 +819,6 @@ else:
 
     session_id = session["id"]
 
-    # ─── Title + Export ───
     c_title, c_export = st.columns([6, 1])
     with c_title:
         new_title = st.text_input("Title", value=session["title"],
@@ -920,15 +835,12 @@ else:
                                        file_name=os.path.basename(path),
                                        mime="application/pdf")
 
-    # ─── PDF Upload ───
     st.markdown("---")
     active_pdfs = get_active_pdfs(session_id)
 
     cu, cm = st.columns([3, 2])
     with cu:
         if len(active_pdfs) < 3:
-            # Streamlit file_uploader preserves selected files across reruns.
-            # To clear it after a successful upload, rotate its key using a per-session nonce.
             nonce_key = f"up_nonce_{session_id}"
             if nonce_key not in st.session_state:
                 st.session_state[nonce_key] = 0
@@ -962,7 +874,6 @@ else:
 
                     with st.spinner(f"Processing {uf.name}..."):
                         paper = processor.process(filepath)
-                        # Generate summary using bot
                         bot.current_paper = paper
                         bot.retriever.build_index(paper.chunks)
                         summary_resp = bot.ask("Give me a brief summary of this paper.",
@@ -976,10 +887,9 @@ else:
 
                     st.session_state.suggested_questions = generate_suggested_questions(
                         {"sections": list(paper.sections.keys())})
-                    st.session_state.papers_loaded_key = None  # Force reload
+                    st.session_state.papers_loaded_key = None
                     st.success(f"✅ {uf.name}")
 
-                # Rotate the uploader key to clear the selected files on the next run.
                 st.session_state[nonce_key] += 1
                 st.rerun()
         else:
@@ -998,7 +908,6 @@ else:
                         st.session_state.papers_loaded_key = None
                         st.rerun()
 
-    # ─── Summaries ───
     active_pdfs = get_active_pdfs(session_id)
     if active_pdfs:
         with st.expander("📋 PDF Summaries", expanded=False):
@@ -1007,7 +916,6 @@ else:
                     <strong>📄 {pdf['filename']}</strong> — {pdf['num_pages']}p, {pdf['num_chunks']} chunks<br>
                     <em>{pdf['summary']}</em></div>""", unsafe_allow_html=True)
 
-    # ─── Suggested Questions ───
     if st.session_state.suggested_questions and active_pdfs:
         st.markdown("**💡 Suggested:**")
         cols = st.columns(3)
@@ -1019,12 +927,10 @@ else:
 
     st.markdown("---")
 
-    # ─── Load ALL PDFs into bot ───
     messages = get_messages(session_id)
     if active_pdfs:
         load_all_pdfs_into_bot(session_id, active_pdfs, messages)
 
-    # ─── Chat Messages ───
     for msg in messages:
         avatar = "🧑" if msg["role"] == "user" else "🤖"
         with st.chat_message(msg["role"], avatar=avatar):
@@ -1033,9 +939,7 @@ else:
             if msg["role"] == "assistant" and msg.get("confidence", 0) > 0:
                 sources = msg.get("sources", [])
 
-                # ─── VISUALIZATIONS ───
                 with st.expander("📊 Answer Analytics", expanded=False):
-                    # Row 1: Confidence + Source Scores
                     v1, v2 = st.columns(2)
                     with v1:
                         st.plotly_chart(create_confidence_gauge(msg["confidence"]),
@@ -1053,7 +957,6 @@ else:
                                 key=f"chart_sources_{msg['id']}"
                             )
 
-                    # Row 2: Method Pie + Score Heatmap
                     v3, v4 = st.columns(2)
                     with v3:
                         fig = create_method_pie(sources)
@@ -1072,12 +975,10 @@ else:
                                 key=f"chart_heatmap_{msg['id']}"
                             )
 
-                    # Row 3: 3D Vector Space
                     if sources and len(sources) >= 2:
                         st.markdown("**🌐 3D Vector Space Projection (PCA)**")
                         st.caption("Red diamond = your query. Green = high score chunks. "
                                    "Dashed lines = similarity connections.")
-                        # Get the query from the previous user message
                         prev_user = [m for m in messages if m["id"] < msg["id"] and m["role"] == "user"]
                         query_text = prev_user[-1]["content"] if prev_user else "query"
                         bot = get_bot()
@@ -1089,7 +990,6 @@ else:
                                 key=f"chart_3d_{msg['id']}"
                             )
 
-                    # Row 4: Chunk Lengths + Answer Keywords
                     v5, v6 = st.columns(2)
                     with v5:
                         fig = create_chunk_length_chart(sources)
@@ -1108,7 +1008,6 @@ else:
                                 key=f"chart_wordcloud_{msg['id']}"
                             )
 
-                    # Source Text Highlights
                     if sources:
                         st.markdown("**📝 Source Passages:**")
                         for idx, src in enumerate(sources[:5]):
@@ -1121,10 +1020,8 @@ else:
                             full_text = src.get("text") or src.get("text_preview", "")
                             st.caption(full_text)
 
-                    # PDF Page Viewer
                     if sources and active_pdfs:
                         st.markdown("**📄 Referenced Pages:**")
-                        # Let user pick which PDF to view
                         pdf_names = [p["filename"] for p in active_pdfs]
                         selected_pdf_name = st.selectbox(
                             "View PDF:", pdf_names,
@@ -1138,8 +1035,6 @@ else:
                                 pages = src.get("page_numbers", [])
                                 if pages:
                                     pnum = pages[0] - 1
-                                    # If the source section is tagged like "[file.pdf] ...",
-                                    # prefer rendering/highlighting against that PDF.
                                     pdf_for_source = selected_pdf
                                     sec = (src.get("section") or "").strip()
                                     if sec.startswith("[") and "]" in sec:
@@ -1163,10 +1058,8 @@ else:
                                                  width=550)
                                     break
 
-    # ─── Sticky Composer (Prompt + Settings) ───
     pending = st.session_state.pop("pending_question", None)
 
-    # If a suggested question was clicked, prefill the input.
     prompt_key = f"prompt_{session_id}"
     if pending:
         st.session_state[prompt_key] = pending
@@ -1202,14 +1095,46 @@ else:
 
             sent = st.form_submit_button("Send")
 
-    # Avoid updating `updated_at` (and reordering sidebar sessions) unless settings actually changed.
+        components.html(
+                """
+                <script>
+                (function () {
+                    function setComposerHeight() {
+                        try {
+                            const doc = window.parent.document;
+                            const composer = doc.querySelector('.st-key-composer');
+                            if (!composer) return;
+                            const h = Math.ceil(composer.getBoundingClientRect().height);
+                            if (h > 0) doc.documentElement.style.setProperty('--composer-height', h + 'px');
+                        } catch (e) {}
+                    }
+
+                    setComposerHeight();
+
+                    try {
+                        const doc = window.parent.document;
+                        const composer = doc.querySelector('.st-key-composer');
+                        if (composer && 'ResizeObserver' in window.parent) {
+                            const ro = new window.parent.ResizeObserver(setComposerHeight);
+                            ro.observe(composer);
+                        }
+                    } catch (e) {}
+
+                    try {
+                        window.parent.addEventListener('resize', setComposerHeight);
+                    } catch (e) {}
+                })();
+                </script>
+                """,
+                height=0,
+        )
+
     if (leniency != session.get("leniency", 50)) or (top_k != session.get("top_k", 5)):
         update_session_settings(session_id, leniency, top_k)
 
     if sent:
         prompt = (prompt_text or "").strip()
     elif pending:
-        # Preserve the old behavior: suggested questions send immediately.
         prompt = (pending or "").strip()
         st.session_state[prompt_key] = ""
     else:
