@@ -30,9 +30,22 @@ from database import (
 )
 from pdf_export import export_chat_to_pdf
 
+# Try to import delete_message; provide fallback if database.py doesn't have it yet.
+try:
+    from database import delete_message
+except ImportError:
+    def delete_message(message_id):
+        """Fallback: delete a message by ID directly from the SQLite database."""
+        import sqlite3
+        db_path = os.path.join("data", "jarvis.db")
+        conn = sqlite3.connect(db_path)
+        conn.execute("DELETE FROM messages WHERE id = ?", (message_id,))
+        conn.commit()
+        conn.close()
+
 st.set_page_config(
     page_title="Jarvis Mk.X",
-    page_icon="🤖",
+    page_icon="J",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -215,8 +228,24 @@ st.markdown("""
     .stat-card { background: #1e1e2e; padding: 10px 14px; border-radius: 8px;
                  text-align: center; border: 1px solid #333; }
 
+    /* Chat message delete buttons */
+    [data-testid="stChatMessage"] [class*="st-key-del_"] .stButton > button {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: rgba(148, 163, 184, 0.35) !important;
+        font-size: 0.72em !important;
+        padding: 2px 6px !important;
+        min-height: 0 !important;
+        transform: none !important;
+    }
+    [data-testid="stChatMessage"] [class*="st-key-del_"] .stButton > button:hover {
+        color: #f87171 !important;
+        background: rgba(248, 113, 113, 0.08) !important;
+    }
+
     [data-testid="stMainBlockContainer"], .main .block-container {
-        padding-bottom: calc(var(--composer-height, 260px)) !important;
+        padding-bottom: calc(var(--composer-height, 260px) + 10rem) !important;
     }
 
     .st-key-composer {
@@ -232,6 +261,27 @@ st.markdown("""
         background: rgba(13, 17, 23, 0.88) !important;
         backdrop-filter: blur(10px) !important;
         border-top: 1px solid rgba(148, 163, 184, 0.18) !important;
+    }
+    .st-key-composer .stFormSubmitButton > button {
+        background: linear-gradient(135deg, #2563eb 0%, #1d4ed8 100%) !important;
+        border: none !important;
+        border-radius: 10px !important;
+        color: #f0f6ff !important;
+        font-size: 1.1em !important;
+        min-height: 2.4rem !important;
+        padding: 0 0.6rem !important;
+        cursor: pointer !important;
+        transition: transform 0.1s ease, box-shadow 0.15s ease !important;
+    }
+    .st-key-composer .stFormSubmitButton > button:hover {
+        transform: translateY(-1px) !important;
+        box-shadow: 0 2px 10px rgba(37,99,235,0.35) !important;
+    }
+    .st-key-composer .stSlider { padding-top: 0.35rem !important; }
+    .st-key-composer .stSlider [data-testid="stTickBarMin"],
+    .st-key-composer .stSlider [data-testid="stTickBarMax"] {
+        font-size: 0.65em !important;
+        color: rgba(148,163,184,0.5) !important;
     }
 
     body:has([data-testid="stSidebar"][aria-expanded="true"]) .st-key-composer {
@@ -251,9 +301,11 @@ def init_state():
         "current_session": None,
         "bot": None,
         "bot_loaded": False,
+        "bot_model_key": None,
         "papers_loaded_key": None,
         "suggested_questions": [],
         "all_chunks_cache": [],
+        "current_model": "jarvis_finetuned",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -261,36 +313,219 @@ def init_state():
 
 init_state()
 
+# ─── VRAM Detection ─────────────────────────────────────────────────────────
+def detect_gpu_info():
+    """Detect GPU and available VRAM. Returns (gpu_name, vram_gb) or (None, 0)."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+            return name, round(vram, 1)
+    except Exception:
+        pass
+    return None, 0
 
-@st.cache_resource(show_spinner=False)
-def load_bot():
+GPU_NAME, GPU_VRAM_GB = detect_gpu_info()
+HIGH_VRAM = GPU_VRAM_GB >= 8  # Mistral-7B fits on 8GB+ GPUs (4-bit)
+
+# ─── Model Configurations ───────────────────────────────────────────────────
+# min_vram: minimum GB needed to run locally. Models above budget → API fallback.
+MODEL_CONFIGS = {
+    "jarvis_finetuned": {
+        "label": "Jarvis Mk.X (Fine-tuned Mistral)",
+        "base_model": "mistralai/Mistral-7B-Instruct-v0.3",
+        "adapter_path": "models/jarvis-mkx-adapter-v2",
+        "short_name": "Jarvis Mk.X",
+        "description": "Our QLoRA fine-tuned Mistral-7B on QASPER",
+        "is_api": False,
+        "min_vram": 8,
+    },
+    "mistral_base": {
+        "label": "Mistral-7B (Base)",
+        "base_model": "mistralai/Mistral-7B-Instruct-v0.3",
+        "adapter_path": None,
+        "short_name": "Mistral-7B Base",
+        "description": "Base Mistral-7B-Instruct without fine-tuning",
+        "is_api": False,
+        "min_vram": 8,
+    },
+    "deepseek_v3_api": {
+        "label": "DeepSeek-V3 (API)",
+        "base_model": None,
+        "adapter_path": None,
+        "short_name": "DeepSeek-V3",
+        "description": "671B MoE model via API — no GPU needed",
+        "is_api": True,
+        "min_vram": 0,
+    },
+}
+
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-78346e48330a4966a0a62a8ff8ced452")
+
+
+def get_available_models():
+    """Return model keys that can run on this hardware."""
+    available = {}
+    for key, cfg in MODEL_CONFIGS.items():
+        if cfg["is_api"]:
+            # API models always available
+            available[key] = cfg
+        elif GPU_VRAM_GB >= cfg["min_vram"]:
+            # Enough VRAM for local model
+            available[key] = cfg
+        elif cfg.get("api_fallback"):
+            # Mark as API fallback
+            fallback_cfg = dict(cfg)
+            fallback_cfg["label"] = cfg["label"] + " (via API)"
+            fallback_cfg["short_name"] = cfg["short_name"] + " (API)"
+            fallback_cfg["is_api"] = True
+            fallback_cfg["_is_fallback"] = True
+            available[key] = fallback_cfg
+        # else: model is unavailable on this hardware
+    return available
+
+
+AVAILABLE_MODELS = get_available_models()
+
+
+def _get_embed_model_name():
+    forced = os.environ.get("JARVIS_EMBED_MODEL", "").strip()
+    if forced:
+        return forced
+    return (
+        "voyage-4-large"
+        if os.environ.get("VOYAGE_API_KEY")
+        else "sentence-transformers/allenai-specter"
+    )
+
+
+def load_bot(model_key="jarvis_finetuned"):
+    """Load a JarvisBot with the specified model configuration."""
     from bot import JarvisBot
-    forced_embed_model = os.environ.get("JARVIS_EMBED_MODEL", "").strip()
-    if forced_embed_model:
-        embed_model_name = forced_embed_model
-    else:
-        embed_model_name = (
-            "voyage-4-large"
-            if os.environ.get("VOYAGE_API_KEY")
-            else "sentence-transformers/allenai-specter"
-        )
+    config = AVAILABLE_MODELS.get(model_key, MODEL_CONFIGS.get(model_key))
 
     bot = JarvisBot(
-        base_model_name="mistralai/Mistral-7B-Instruct-v0.3",
-        adapter_path="models/jarvis-mkx-adapter-v2",
-        embed_model_name=embed_model_name,
+        base_model_name=config["base_model"],
+        adapter_path=config.get("adapter_path"),
+        embed_model_name=_get_embed_model_name(),
         chunk_size=512, chunk_overlap=50, load_in_4bit=True,
     )
     bot.load_model()
     return bot
 
 
-def get_bot():
+def _load_retriever_only_bot():
+    """Load a minimal bot that only has a retriever (no LLM). For API-only mode."""
+    from bot import JarvisBot
+    bot = JarvisBot(
+        base_model_name="mistralai/Mistral-7B-Instruct-v0.3",  # won't load
+        adapter_path=None,
+        embed_model_name=_get_embed_model_name(),
+        chunk_size=512, chunk_overlap=50, load_in_4bit=True,
+    )
+    # DON'T call bot.load_model() — only the retriever/processor are set up
+    print("Retriever-only bot initialized (no LLM loaded — API mode)")
+    return bot
+
+
+def get_bot(model_key=None):
+    """Get or reload the bot, switching models if needed."""
+    if model_key is None:
+        model_key = st.session_state.get("current_model", "jarvis_finetuned")
+
+    config = AVAILABLE_MODELS.get(model_key, MODEL_CONFIGS.get(model_key))
+
+    # ── API model: just need retriever, not a full LLM ──────────────────
+    if config.get("is_api"):
+        if st.session_state.bot is not None:
+            return st.session_state.bot
+        # No local model loaded yet — load retriever-only bot
+        if HIGH_VRAM:
+            # On high VRAM, load Jarvis as default (will be used for retrieval)
+            with st.spinner("Loading Jarvis Mk.X for retrieval..."):
+                st.session_state.bot = load_bot("jarvis_finetuned")
+                st.session_state.bot_model_key = "jarvis_finetuned"
+                st.session_state.bot_loaded = True
+        else:
+            # On low VRAM, load retriever-only (no LLM in memory)
+            with st.spinner("Loading retriever..."):
+                st.session_state.bot = _load_retriever_only_bot()
+                st.session_state.bot_model_key = "_retriever_only"
+                st.session_state.bot_loaded = True
+        return st.session_state.bot
+
+    # ── Local model: swap if different from current ──────────────────────
+    if st.session_state.bot_model_key != model_key:
+        # Unload old model
+        if st.session_state.bot is not None:
+            try:
+                st.session_state.bot.unload_model()
+            except Exception:
+                pass
+            del st.session_state.bot
+            st.session_state.bot = None
+            import gc
+            gc.collect()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        st.session_state.papers_loaded_key = None  # Force re-index after swap
+
     if st.session_state.bot is None:
-        with st.spinner("🧠 Loading Jarvis AI (first time ~30s)..."):
-            st.session_state.bot = load_bot()
+        short = config["short_name"]
+        with st.spinner(f"Loading {short} (~30-60s on first load)..."):
+            st.session_state.bot = load_bot(model_key)
             st.session_state.bot_loaded = True
+            st.session_state.bot_model_key = model_key
+
     return st.session_state.bot
+
+
+def query_deepseek_api(prompt, context_chunks, leniency=50, model="deepseek-chat"):
+    """Generate an answer using DeepSeek API with retrieved context."""
+    import requests
+
+    context_text = "\n\n".join([
+        f"[Source {i+1}] {getattr(c, 'section', 'Unknown')}:\n{c.text}"
+        for i, c in enumerate(context_chunks[:5])
+    ]) if context_chunks else "No context available."
+
+    temperature = 0.1 + (leniency / 100) * 0.6
+
+    system_msg = (
+        "You are Jarvis Mk.X, a research paper Q&A assistant. "
+        "Answer based on the provided context from research papers. "
+        "Explain in your own words. If context is insufficient, say so."
+    )
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": f"### Context from Research Paper:\n{context_text}\n\n### Question:\n{prompt}"},
+    ]
+
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": 500,
+        "temperature": temperature,
+    }
+
+    try:
+        r = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers=headers, json=payload, timeout=60
+        )
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"DeepSeek API error: {e}"
 
 
 def load_all_pdfs_into_bot(session_id, active_pdfs, messages):
@@ -301,7 +536,14 @@ def load_all_pdfs_into_bot(session_id, active_pdfs, messages):
     if st.session_state.papers_loaded_key == cache_key:
         return
 
-    bot = get_bot()
+    # Only need the retriever for indexing — don't force full LLM load
+    if st.session_state.bot is None:
+        with st.spinner("Setting up retriever..."):
+            st.session_state.bot = _load_retriever_only_bot()
+            st.session_state.bot_model_key = "_retriever_only"
+            st.session_state.bot_loaded = True
+
+    bot = st.session_state.bot
     from processor import PaperProcessor
 
     processor = PaperProcessor(chunk_size=512, chunk_overlap=50)
@@ -801,14 +1043,32 @@ with st.sidebar:
 if st.session_state.current_session is None:
     st.markdown("# Jarvis Mk.X")
     st.markdown("### Smart Research Paper Chatbot")
-    st.markdown("""
-    Upload research papers and ask questions. Jarvis uses fine-tuned Mistral 7B
-    with hybrid retrieval (Voyage 3 Large + ChromaDB + BM25).
 
-    **Features:** Up to 3 PDFs | Persistent memory | Adjustable settings |
+    # GPU info banner
+    if GPU_NAME:
+        gpu_badge = f"**{GPU_NAME}** — {GPU_VRAM_GB}GB VRAM"
+        if HIGH_VRAM:
+            gpu_badge += " (all models available)"
+        else:
+            gpu_badge += " (API mode — local 32B models require ≥20GB)"
+        st.info(gpu_badge)
+    else:
+        st.warning("No GPU detected — only API models available")
+
+    st.markdown("**Available models on this machine:**")
+    for key, cfg in AVAILABLE_MODELS.items():
+        api_tag = " *(via API)*" if cfg.get("is_api") else " *(local)*"
+        st.markdown(f"- {cfg['label']}{api_tag}")
+
+    unavailable = [cfg["label"] for k, cfg in MODEL_CONFIGS.items() if k not in AVAILABLE_MODELS]
+    if unavailable:
+        st.caption(f"Not available ({GPU_VRAM_GB}GB VRAM): {', '.join(unavailable)}")
+
+    st.markdown("""
+    **Features:** Up to 3 PDFs | Adjustable Leniency & Top-K |
     Visualizations | Answer correction | PDF export
 
-    👉 Click **New Chat** to start!
+    Click **New Chat** to start!
     """)
 
 else:
@@ -825,8 +1085,9 @@ else:
                                    label_visibility="collapsed")
         if new_title != session["title"]:
             update_session_title(session_id, new_title)
+            st.rerun()  # Refresh so sidebar reflects the new title
     with c_export:
-        if st.button("📥 Export"):
+        if st.button("Export"):
             msgs = get_messages(session_id)
             if msgs:
                 path = export_chat_to_pdf(session["title"], msgs)
@@ -847,13 +1108,12 @@ else:
             uploader_key = f"up_{session_id}_{st.session_state[nonce_key]}"
 
             uploaded = st.file_uploader(
-                f"📄 Upload PDF ({len(active_pdfs)}/3)",
+                f"Upload PDF ({len(active_pdfs)}/3)",
                 type=["pdf"],
                 accept_multiple_files=True,
                 key=uploader_key,
             )
             if uploaded:
-                bot = get_bot()
                 from processor import PaperProcessor
                 processor = PaperProcessor(chunk_size=512, chunk_overlap=50)
 
@@ -874,11 +1134,15 @@ else:
 
                     with st.spinner(f"Processing {uf.name}..."):
                         paper = processor.process(filepath)
-                        bot.current_paper = paper
-                        bot.retriever.build_index(paper.chunks)
-                        summary_resp = bot.ask("Give me a brief summary of this paper.",
-                                                leniency=100)
-                        summary = summary_resp.answer if summary_resp.answer else "Summary unavailable."
+
+                        # Generate summary from extracted text (no LLM needed)
+                        if paper.abstract:
+                            summary = paper.abstract[:500]
+                        elif paper.sections:
+                            first_section = list(paper.sections.values())[0]
+                            summary = first_section[:500]
+                        else:
+                            summary = "Summary will be available when you ask your first question."
 
                     add_pdf(session_id=session_id, filename=uf.name, filepath=filepath,
                             summary=summary, num_pages=paper.num_pages,
@@ -888,12 +1152,12 @@ else:
                     st.session_state.suggested_questions = generate_suggested_questions(
                         {"sections": list(paper.sections.keys())})
                     st.session_state.papers_loaded_key = None
-                    st.success(f"✅ {uf.name}")
+                    st.success(f"Uploaded: {uf.name}")
 
                 st.session_state[nonce_key] += 1
                 st.rerun()
         else:
-            st.info("📄 3/3 PDFs uploaded.")
+            st.info("3/3 PDFs uploaded.")
 
     with cm:
         if active_pdfs:
@@ -901,23 +1165,23 @@ else:
             for pdf in active_pdfs:
                 pc1, pc2 = st.columns([4, 1])
                 with pc1:
-                    st.caption(f"📄 {pdf['filename']} ({pdf['num_pages']}p, {pdf['num_chunks']} chunks)")
+                    st.caption(f"{pdf['filename']} ({pdf['num_pages']}p, {pdf['num_chunks']} chunks)")
                 with pc2:
-                    if st.button("❌", key=f"rm_{pdf['id']}"):
+                    if st.button("Remove", key=f"rm_{pdf['id']}"):
                         remove_pdf(pdf["id"])
                         st.session_state.papers_loaded_key = None
                         st.rerun()
 
     active_pdfs = get_active_pdfs(session_id)
     if active_pdfs:
-        with st.expander("📋 PDF Summaries", expanded=False):
+        with st.expander("PDF Summaries", expanded=False):
             for pdf in active_pdfs:
                 st.markdown(f"""<div class="pdf-summary">
-                    <strong>📄 {pdf['filename']}</strong> — {pdf['num_pages']}p, {pdf['num_chunks']} chunks<br>
+                    <strong>{pdf['filename']}</strong> — {pdf['num_pages']}p, {pdf['num_chunks']} chunks<br>
                     <em>{pdf['summary']}</em></div>""", unsafe_allow_html=True)
 
     if st.session_state.suggested_questions and active_pdfs:
-        st.markdown("**💡 Suggested:**")
+        st.markdown("**Suggested:**")
         cols = st.columns(3)
         for idx, q in enumerate(st.session_state.suggested_questions[:6]):
             with cols[idx % 3]:
@@ -931,23 +1195,43 @@ else:
     if active_pdfs:
         load_all_pdfs_into_bot(session_id, active_pdfs, messages)
 
-    for msg in messages:
-        avatar = "🧑" if msg["role"] == "user" else "🤖"
-        with st.chat_message(msg["role"], avatar=avatar):
+    for idx, msg in enumerate(messages):
+        with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+
+            # User messages: show settings pills + delete button
+            if msg["role"] == "user":
+                pills_html = msg.get("retrieval_methods", "")
+                col_pills, col_del = st.columns([6, 1])
+                with col_pills:
+                    if pills_html:
+                        st.markdown(
+                            f"<div style='display:flex; gap:5px; margin-top:4px; flex-wrap:wrap; "
+                            f"opacity:0.7;'>{pills_html}</div>",
+                            unsafe_allow_html=True,
+                        )
+                with col_del:
+                    if st.button("Delete", key=f"del_{msg['id']}",
+                                 help="Delete this Q&A pair"):
+                        # Delete the user message
+                        delete_message(msg["id"])
+                        # Delete the paired assistant message (next message)
+                        if idx + 1 < len(messages) and messages[idx + 1]["role"] == "assistant":
+                            delete_message(messages[idx + 1]["id"])
+                        st.rerun()
 
             if msg["role"] == "assistant" and msg.get("confidence", 0) > 0:
                 sources = msg.get("sources", [])
 
-                with st.expander("📊 Answer Analytics", expanded=False):
+                with st.expander("Answer Analytics", expanded=False):
                     v1, v2 = st.columns(2)
                     with v1:
                         st.plotly_chart(create_confidence_gauge(msg["confidence"]),
                                          use_container_width=True,
                                          key=f"chart_conf_{msg['id']}"
                                          )
-                        st.caption(f"⏱️ {msg.get('generation_time', 0):.1f}s | "
-                                   f"🔗 {msg.get('retrieval_methods', 'N/A')}")
+                        st.caption(f"{msg.get('generation_time', 0):.1f}s | "
+                                   f"{msg.get('retrieval_methods', 'N/A')}")
                     with v2:
                         fig = create_source_chart(sources)
                         if fig:
@@ -976,7 +1260,7 @@ else:
                             )
 
                     if sources and len(sources) >= 2:
-                        st.markdown("**🌐 3D Vector Space Projection (PCA)**")
+                        st.markdown("**3D Vector Space Projection (PCA)**")
                         st.caption("Red diamond = your query. Green = high score chunks. "
                                    "Dashed lines = similarity connections.")
                         prev_user = [m for m in messages if m["id"] < msg["id"] and m["role"] == "user"]
@@ -1009,11 +1293,11 @@ else:
                             )
 
                     if sources:
-                        st.markdown("**📝 Source Passages:**")
+                        st.markdown("**Source Passages:**")
                         for idx, src in enumerate(sources[:5]):
-                            badge = ("🔵 Dense" if src.get("method") == "dense"
-                                     else "🟠 Sparse" if src.get("method") == "sparse"
-                                     else "🟢 Hybrid")
+                            badge = ("Dense" if src.get("method") == "dense"
+                                     else "Sparse" if src.get("method") == "sparse"
+                                     else "Hybrid")
                             st.markdown(f"**Source {idx+1}** [{src.get('section', '?')}] "
                                         f"p.{src.get('page_numbers', '?')} | "
                                         f"Score: {src.get('score', 0):.3f} | {badge}")
@@ -1021,7 +1305,7 @@ else:
                             st.caption(full_text)
 
                     if sources and active_pdfs:
-                        st.markdown("**📄 Referenced Pages:**")
+                        st.markdown("**Referenced Pages:**")
                         pdf_names = [p["filename"] for p in active_pdfs]
                         selected_pdf_name = st.selectbox(
                             "View PDF:", pdf_names,
@@ -1073,10 +1357,25 @@ else:
                 placeholder="Ask about your research papers...",
             )
 
-            c1, c2 = st.columns(2)
+            c_model, c1, c2, c_send = st.columns([2.2, 1, 1, 0.6])
+            with c_model:
+                model_options = list(AVAILABLE_MODELS.keys())
+                model_labels = [AVAILABLE_MODELS[k]["label"] for k in model_options]
+                default_model = st.session_state.get("current_model", "jarvis_finetuned")
+                if default_model not in model_options:
+                    default_model = model_options[0]
+                current_idx = model_options.index(default_model)
+                selected_label = st.selectbox(
+                    "Model",
+                    model_labels,
+                    index=current_idx,
+                    key=f"model_select_{session_id}",
+                    label_visibility="collapsed",
+                )
+                selected_model_key = model_options[model_labels.index(selected_label)]
             with c1:
                 leniency = st.slider(
-                    "🎚️ Leniency",
+                    "Leniency",
                     0,
                     100,
                     int(session.get("leniency", 50)),
@@ -1085,15 +1384,15 @@ else:
                 )
             with c2:
                 top_k = st.slider(
-                    "🔍 Top-K",
+                    "Top-K",
                     1,
                     10,
                     int(session.get("top_k", 5)),
                     help="Chunks to retrieve",
                     key=f"topk_{session_id}",
                 )
-
-            sent = st.form_submit_button("Send")
+            with c_send:
+                sent = st.form_submit_button("Send")
 
         components.html(
                 """
@@ -1129,6 +1428,9 @@ else:
                 height=0,
         )
 
+    # Update model selection in session state
+    st.session_state.current_model = selected_model_key
+
     if (leniency != session.get("leniency", 50)) or (top_k != session.get("top_k", 5)):
         update_session_settings(session_id, leniency, top_k)
 
@@ -1141,16 +1443,57 @@ else:
         prompt = None
     if prompt:
         if not active_pdfs:
-            st.warning("📄 Upload a PDF first!")
+            st.warning("Upload a PDF first.")
         else:
-            with st.chat_message("user", avatar="🧑"):
-                st.markdown(prompt)
-            add_message(session_id, "user", prompt)
+            model_config = AVAILABLE_MODELS.get(selected_model_key, MODEL_CONFIGS.get(selected_model_key))
+            _short = model_config['short_name']
 
-            with st.chat_message("assistant", avatar="🤖"):
-                with st.spinner("🧠 Thinking..."):
-                    bot = get_bot()
-                    response = bot.ask(prompt, top_k=top_k, leniency=leniency)
+            # Build settings pills HTML (shown on user bubble + stored in DB)
+            settings_pills_html = (
+                f"<span style='background:rgba(37,99,235,0.22); color:#93c5fd; "
+                f"padding:2px 8px; border-radius:10px; font-size:0.72em;'>{_short}</span>"
+                f"<span style='background:rgba(22,101,52,0.22); color:#86efac; "
+                f"padding:2px 8px; border-radius:10px; font-size:0.72em;'>Leniency: {leniency}</span>"
+                f"<span style='background:rgba(88,28,135,0.22); color:#c4b5fd; "
+                f"padding:2px 8px; border-radius:10px; font-size:0.72em;'>Top-K: {top_k}</span>"
+            )
+
+            with st.chat_message("user"):
+                st.markdown(prompt)
+                st.markdown(
+                    f"<div style='display:flex; gap:5px; margin-top:4px; flex-wrap:wrap; "
+                    f"opacity:0.7;'>{settings_pills_html}</div>",
+                    unsafe_allow_html=True,
+                )
+            add_message(session_id, "user", prompt,
+                        retrieval_methods=settings_pills_html)
+
+            with st.chat_message("assistant"):
+                with st.spinner(f"{_short} is thinking..."):
+                    start_time = time.time()
+                    bot = get_bot(selected_model_key)
+
+                    # Ensure PDFs are indexed on this bot (needed after model swap)
+                    load_all_pdfs_into_bot(session_id, active_pdfs, messages)
+
+                    if model_config.get("is_api"):
+                        # API model: use bot for retrieval, API for generation
+                        retrieved = bot.retriever.retrieve(prompt, top_k=top_k)
+                        answer_text = query_deepseek_api(prompt, retrieved, leniency)
+                        gen_time = time.time() - start_time
+
+                        # Build a response-like object
+                        class _ApiResponse:
+                            pass
+                        response = _ApiResponse()
+                        response.answer = answer_text
+                        response.sources = retrieved
+                        response.confidence = 0.5
+                        response.generation_time = gen_time
+                    else:
+                        # Local model
+                        response = bot.ask(prompt, top_k=top_k, leniency=leniency)
+
                 st.markdown(response.answer)
 
                 sources_data = format_sources_for_db(response.sources)
@@ -1163,7 +1506,7 @@ else:
                     confidence=response.confidence,
                     generation_time=response.generation_time,
                     sources=sources_data,
-                    retrieval_methods=", ".join(methods),
+                    retrieval_methods=f"{model_config['short_name']} | " + ", ".join(methods),
                 )
 
             if len(get_messages(session_id)) <= 2:

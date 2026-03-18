@@ -1,5 +1,14 @@
 [server]
+maxMessageSize = 500
+headless = true
+enableWebsocketCompression = false
 maxUploadSize = 200
+
+[runner]
+fastReruns = true
+
+[browser]
+gatherUsageStats = false
 
 [theme]
 base = "dark"

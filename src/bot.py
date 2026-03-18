@@ -72,21 +72,56 @@ class JarvisBot:
             print("Model already loaded.")
             return
         print(f"Loading base model: {self.base_model_name}")
-        bnb_config = None
-        if self.load_in_4bit:
+
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            self.base_model_name, trust_remote_code=True,
+        )
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        self.tokenizer.padding_side = "right"
+
+        model_kwargs = {
+            "device_map": "auto",
+            "torch_dtype": torch.bfloat16,
+            "trust_remote_code": True,
+            "low_cpu_mem_usage": True,
+            "max_memory": {0: "23GiB", "cpu": "10GiB"},
+        }
+
+        # bitsandbytes 4-bit quantization crashes silently on Windows (C++ segfault).
+        # On Windows: always use bfloat16 (works fine on 24GB GPUs).
+        # On Linux:   use 4-bit if requested (saves ~10GB VRAM).
+        import platform
+        use_4bit = self.load_in_4bit and platform.system() != "Windows"
+
+        if use_4bit:
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True, bnb_4bit_quant_type="nf4",
                 bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
             )
-        self.tokenizer = AutoTokenizer.from_pretrained(self.base_model_name)
-        self.tokenizer.pad_token = self.tokenizer.eos_token
-        self.tokenizer.padding_side = "right"
-        model_kwargs = {"device_map": "auto", "torch_dtype": torch.bfloat16}
-        if bnb_config:
-            model_kwargs["quantization_config"] = bnb_config
-        base_model = AutoModelForCausalLM.from_pretrained(self.base_model_name, **model_kwargs)
-        print(f"Loading LoRA adapter: {self.adapter_path}")
-        self.model = PeftModel.from_pretrained(base_model, self.adapter_path)
+            bnb_kwargs = {**model_kwargs, "quantization_config": bnb_config}
+            bnb_kwargs.pop("max_memory", None)
+            base_model = AutoModelForCausalLM.from_pretrained(self.base_model_name, **bnb_kwargs)
+            print("Loaded with 4-bit quantization")
+        else:
+            if platform.system() == "Windows" and self.load_in_4bit:
+                print("Skipping 4-bit quantization (bitsandbytes unstable on Windows)")
+                print("  Using bfloat16 instead — fits on 24GB GPUs")
+            base_model = AutoModelForCausalLM.from_pretrained(self.base_model_name, **model_kwargs)
+            print("Loaded in bfloat16")
+
+        if self.adapter_path:
+            import os
+            if os.path.isdir(self.adapter_path):
+                print(f"Loading LoRA adapter: {self.adapter_path}")
+                self.model = PeftModel.from_pretrained(base_model, self.adapter_path)
+            else:
+                print(f"Adapter path not found: {self.adapter_path} — using base model")
+                self.model = base_model
+        else:
+            print("No adapter — using base model directly")
+            self.model = base_model
+
         self.model.eval()
         print("Model loaded and ready.")
 
@@ -422,7 +457,7 @@ class JarvisBot:
             )
 
             answer = (
-                "⚠️ Low retrieval confidence: I may be missing supporting passages in the PDF. "
+                "Low retrieval confidence: I may be missing supporting passages in the PDF. "
                 "Answering using the closest matches I found.\n\n" + answer
             )
 
@@ -478,16 +513,33 @@ class JarvisBot:
         # Keep limited conversation continuity, but avoid feeding back responses
         # that are explicitly retrieval failures (they can prime the model to
         # keep refusing even when later retrieval succeeds).
+        history_msgs = []
         if self.conversation_history:
             for turn in self.conversation_history:
                 if turn.role == "assistant":
                     content = (turn.content or "").strip()
                     if (
                         "I couldn't retrieve any relevant passages" in content
-                        or content.startswith("⚠️ Low retrieval confidence")
+                        or content.startswith("Low retrieval confidence")
                     ):
                         continue
-                messages.append({"role": turn.role, "content": turn.content})
+                history_msgs.append({"role": turn.role, "content": turn.content})
+
+        # Enforce strict user/assistant alternation (Mistral requires this).
+        # Drop any message that would create consecutive same-role entries.
+        cleaned = []
+        for m in history_msgs:
+            if cleaned and cleaned[-1]["role"] == m["role"]:
+                # Same role twice in a row — skip the earlier one
+                cleaned[-1] = m
+            else:
+                cleaned.append(m)
+
+        # The next message we append is "user", so history must not end with "user"
+        if cleaned and cleaned[-1]["role"] == "user":
+            cleaned.pop()
+
+        messages.extend(cleaned)
 
         user_content = (
             f"### Context from Research Paper:\n{context}"

@@ -31,6 +31,9 @@ scikit-learn
 # PDF Export
 fpdf2
 
+# API (DeepSeek-V3)
+requests
+
 # Utilities
 numpy
 pandas

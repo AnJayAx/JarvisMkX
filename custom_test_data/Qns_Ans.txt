@@ -21,6 +21,15 @@ A: Hilary Putnam.
 Q: What possibility arises from the null set definition $\Lambda=_{df}\{x:x\ne x\}$?
 A: A universe in which nothing is self-identical and everything is non-self-identical.
 
+Q: Who is the author?
+Q: What is the thesis of possibilism?
+Q: Which two philosophers objected to the strategy of conventionalism?
+Q: What is Martin's Theorem?
+Q: What does strong paraconsistentism hold?
+Leniency: 10, Top-K: 8
+Q: What possibility arises from the null set definition $\Lambda=_{df}\{x:x\ne x\}$?
+Leniency: 80, Top-K: 3
+
 Global_Energy_Demand_For_Different_Energy_Sources.pdf & Trend_Analysis_of_Global_Energy_Demand...pdf
 
 Single File Questions
