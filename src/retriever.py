@@ -45,7 +45,8 @@ class _SentenceTransformerEmbedder:
                 "sentence-transformers is required for local embeddings. "
                 "Install it with `pip install sentence-transformers`."
             ) from e
-        self._model = SentenceTransformer(model_name)
+        # Force CPU to keep GPU memory free for the LLM
+        self._model = SentenceTransformer(model_name, device="cpu")
 
     def encode(
         self,

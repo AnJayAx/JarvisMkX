@@ -20,6 +20,25 @@ import base64
 from datetime import datetime
 from pathlib import Path
 
+# ─── Load API keys from .env file ──────────────────────────────────────────
+def _load_env_file():
+    """Load key=value pairs from .env file in project root."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip()
+                if key and value and not os.environ.get(key):
+                    os.environ[key] = value
+
+_load_env_file()
+
 sys.path.insert(0, "src")
 
 from database import (
@@ -301,7 +320,6 @@ def init_state():
         "current_session": None,
         "bot": None,
         "bot_loaded": False,
-        "bot_model_key": None,
         "papers_loaded_key": None,
         "suggested_questions": [],
         "all_chunks_cache": [],
@@ -330,38 +348,69 @@ GPU_NAME, GPU_VRAM_GB = detect_gpu_info()
 HIGH_VRAM = GPU_VRAM_GB >= 8  # Mistral-7B fits on 8GB+ GPUs (4-bit)
 
 # ─── Model Configurations ───────────────────────────────────────────────────
-# min_vram: minimum GB needed to run locally. Models above budget → API fallback.
+# Local models: Jarvis (fine-tuned) and DeepSeek-R1-7B (no API available)
+# API models: Qwen3-8B, Llama-3.1-8B, Mistral-7B via OpenRouter; DeepSeek-V3.2 via DeepSeek API
 MODEL_CONFIGS = {
     "jarvis_finetuned": {
-        "label": "Jarvis Mk.X (Fine-tuned Mistral)",
-        "base_model": "mistralai/Mistral-7B-Instruct-v0.3",
-        "adapter_path": "models/jarvis-mkx-adapter-v2",
+        "label": "Jarvis Mk.X (Fine-tuned Qwen3-8B)",
+        "base_model": "Qwen/Qwen3-8B",
+        "adapter_path": "models/jarvis-mkx-qwen3-8b-adapter",
         "short_name": "Jarvis Mk.X",
-        "description": "Our QLoRA fine-tuned Mistral-7B on QASPER",
+        "description": "Our QLoRA fine-tuned Qwen3-8B on QASPER + PubMedQA",
         "is_api": False,
+        "is_qwen3": True,
         "min_vram": 8,
     },
-    "mistral_base": {
-        "label": "Mistral-7B (Base)",
-        "base_model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "deepseek_r1_7b": {
+        "label": "DeepSeek-R1-Distill-Qwen-7B (Local)",
+        "base_model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
         "adapter_path": None,
-        "short_name": "Mistral-7B Base",
-        "description": "Base Mistral-7B-Instruct without fine-tuning",
+        "short_name": "DeepSeek-R1-7B",
+        "description": "DeepSeek R1 distilled into Qwen-7B — local only (no API available)",
         "is_api": False,
+        "is_qwen3": False,
         "min_vram": 8,
+    },
+    "qwen3_base_api": {
+        "label": "Qwen3-8B (API)",
+        "short_name": "Qwen3-8B Base",
+        "description": "Base Qwen3-8B via OpenRouter API — no GPU needed",
+        "is_api": True,
+        "api_provider": "openrouter",
+        "api_model": "qwen/qwen3-8b",
+        "min_vram": 0,
+    },
+    "llama31_api": {
+        "label": "Llama-3.1-8B-Instruct (API)",
+        "short_name": "Llama-3.1-8B",
+        "description": "Meta Llama 3.1 8B via OpenRouter API — no GPU needed",
+        "is_api": True,
+        "api_provider": "openrouter",
+        "api_model": "meta-llama/llama-3.1-8b-instruct",
+        "min_vram": 0,
+    },
+    "mistral_7b_api": {
+        "label": "Mistral-7B-Instruct (API)",
+        "short_name": "Mistral-7B",
+        "description": "Mistral 7B Instruct via OpenRouter API — no GPU needed",
+        "is_api": True,
+        "api_provider": "openrouter",
+        "api_model": "mistralai/mistral-7b-instruct-v0.1",
+        "min_vram": 0,
     },
     "deepseek_v3_api": {
-        "label": "DeepSeek-V3 (API)",
-        "base_model": None,
-        "adapter_path": None,
-        "short_name": "DeepSeek-V3",
-        "description": "671B MoE model via API — no GPU needed",
+        "label": "DeepSeek-V3.2 (API)",
+        "short_name": "DeepSeek-V3.2",
+        "description": "Frontier MoE model via DeepSeek API — no GPU needed",
         "is_api": True,
+        "api_provider": "deepseek",
+        "api_model": "deepseek-chat",
         "min_vram": 0,
     },
 }
 
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-78346e48330a4966a0a62a8ff8ced452")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 
 def get_available_models():
@@ -393,6 +442,8 @@ def _get_embed_model_name():
     forced = os.environ.get("JARVIS_EMBED_MODEL", "").strip()
     if forced:
         return forced
+    # Default: Voyage 4 large (requires VOYAGE_API_KEY env var)
+    # Fallback: SPECTER (free, local, no API key needed)
     return (
         "voyage-4-large"
         if os.environ.get("VOYAGE_API_KEY")
@@ -400,92 +451,93 @@ def _get_embed_model_name():
     )
 
 
-def load_bot(model_key="jarvis_finetuned"):
-    """Load a JarvisBot with the specified model configuration."""
+def _create_bot_shell(model_key="jarvis_finetuned"):
+    """Create a JarvisBot with retriever only — NO LLM loaded.
+
+    The LLM is loaded on-demand per question and unloaded immediately after,
+    keeping GPU memory free between questions. This lets you switch models
+    instantly since only the retriever (CPU) stays resident.
+    """
     from bot import JarvisBot
-    config = AVAILABLE_MODELS.get(model_key, MODEL_CONFIGS.get(model_key))
+    config = AVAILABLE_MODELS.get(model_key, MODEL_CONFIGS.get(model_key, {}))
 
     bot = JarvisBot(
-        base_model_name=config["base_model"],
+        base_model_name=config.get("base_model", "Qwen/Qwen3-8B"),
         adapter_path=config.get("adapter_path"),
         embed_model_name=_get_embed_model_name(),
         chunk_size=512, chunk_overlap=50, load_in_4bit=True,
+        is_qwen3=config.get("is_qwen3", False),
     )
-    bot.load_model()
+    # DON'T call bot.load_model() — LLM loads on demand
+    print(f"Bot shell created (retriever only, no LLM in VRAM)")
     return bot
 
 
-def _load_retriever_only_bot():
-    """Load a minimal bot that only has a retriever (no LLM). For API-only mode."""
-    from bot import JarvisBot
-    bot = JarvisBot(
-        base_model_name="mistralai/Mistral-7B-Instruct-v0.3",  # won't load
-        adapter_path=None,
-        embed_model_name=_get_embed_model_name(),
-        chunk_size=512, chunk_overlap=50, load_in_4bit=True,
-    )
-    # DON'T call bot.load_model() — only the retriever/processor are set up
-    print("Retriever-only bot initialized (no LLM loaded — API mode)")
-    return bot
-
-
-def get_bot(model_key=None):
-    """Get or reload the bot, switching models if needed."""
-    if model_key is None:
-        model_key = st.session_state.get("current_model", "jarvis_finetuned")
-
-    config = AVAILABLE_MODELS.get(model_key, MODEL_CONFIGS.get(model_key))
-
-    # ── API model: just need retriever, not a full LLM ──────────────────
-    if config.get("is_api"):
-        if st.session_state.bot is not None:
-            return st.session_state.bot
-        # No local model loaded yet — load retriever-only bot
-        if HIGH_VRAM:
-            # On high VRAM, load Jarvis as default (will be used for retrieval)
-            with st.spinner("Loading Jarvis Mk.X for retrieval..."):
-                st.session_state.bot = load_bot("jarvis_finetuned")
-                st.session_state.bot_model_key = "jarvis_finetuned"
-                st.session_state.bot_loaded = True
-        else:
-            # On low VRAM, load retriever-only (no LLM in memory)
-            with st.spinner("Loading retriever..."):
-                st.session_state.bot = _load_retriever_only_bot()
-                st.session_state.bot_model_key = "_retriever_only"
-                st.session_state.bot_loaded = True
-        return st.session_state.bot
-
-    # ── Local model: swap if different from current ──────────────────────
-    if st.session_state.bot_model_key != model_key:
-        # Unload old model
-        if st.session_state.bot is not None:
-            try:
-                st.session_state.bot.unload_model()
-            except Exception:
-                pass
-            del st.session_state.bot
-            st.session_state.bot = None
-            import gc
-            gc.collect()
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-        st.session_state.papers_loaded_key = None  # Force re-index after swap
-
+def get_bot():
+    """Get or create the bot shell (retriever only — no LLM resident)."""
     if st.session_state.bot is None:
-        short = config["short_name"]
-        with st.spinner(f"Loading {short} (~30-60s on first load)..."):
-            st.session_state.bot = load_bot(model_key)
+        with st.spinner("Setting up retriever..."):
+            st.session_state.bot = _create_bot_shell()
             st.session_state.bot_loaded = True
-            st.session_state.bot_model_key = model_key
-
     return st.session_state.bot
 
 
-def query_deepseek_api(prompt, context_chunks, leniency=50, model="deepseek-chat"):
-    """Generate an answer using DeepSeek API with retrieved context."""
+def answer_with_model(bot, model_key, prompt, top_k=5, leniency=50,
+                       active_pdfs=None, session_id=None, messages=None):
+    """Load LLM → answer question → unload LLM. GPU is free between calls.
+
+    For API models, no LLM loading is needed — just call the API.
+    For local models, the LLM is loaded, used, and immediately freed.
+    The retriever and PDF index stay in memory (CPU) throughout.
+    """
+    config = AVAILABLE_MODELS.get(model_key, MODEL_CONFIGS.get(model_key))
+
+    # ── API model: no LLM needed ────────────────────────────────────────
+    if config.get("is_api"):
+        retrieved = bot.retriever.retrieve(prompt, top_k=top_k)
+        provider = config.get("api_provider", "deepseek")
+        api_model = config.get("api_model", "deepseek-chat")
+        answer_text = query_api(prompt, retrieved, leniency,
+                                provider=provider, model=api_model)
+
+        class _ApiResponse:
+            pass
+        response = _ApiResponse()
+        response.answer = answer_text
+        response.sources = retrieved
+        response.confidence = 0.5
+        response.generation_time = 0.0
+        return response
+
+    # ── Local model: load → answer → unload ─────────────────────────────
+    import gc
+
+    # Configure bot for this model
+    bot.base_model_name = config["base_model"]
+    bot.adapter_path = config.get("adapter_path")
+    bot.is_qwen3 = config.get("is_qwen3", False)
+
+    try:
+        # Load LLM into VRAM
+        bot.load_model()
+
+        # Answer the question
+        response = bot.ask(prompt, top_k=top_k, leniency=leniency)
+
+    finally:
+        # ALWAYS unload — even if generation fails
+        bot.unload_model()
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    return response
+
+
+def query_api(prompt, context_chunks, leniency=50, provider="deepseek", model="deepseek-chat"):
+    """Generate an answer using an API (OpenRouter or DeepSeek) with retrieved context."""
     import requests
 
     context_text = "\n\n".join([
@@ -506,10 +558,26 @@ def query_deepseek_api(prompt, context_chunks, leniency=50, model="deepseek-chat
         {"role": "user", "content": f"### Context from Research Paper:\n{context_text}\n\n### Question:\n{prompt}"},
     ]
 
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    if provider == "openrouter":
+        api_key = OPENROUTER_API_KEY
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://jarvis-mkx.app",
+            "X-Title": "Jarvis Mk.X",
+        }
+    else:  # deepseek
+        api_key = DEEPSEEK_API_KEY
+        url = "https://api.deepseek.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+    if not api_key:
+        return f"API key not set for {provider}. Set {'OPENROUTER_API_KEY' if provider == 'openrouter' else 'DEEPSEEK_API_KEY'} environment variable."
+
     payload = {
         "model": model,
         "messages": messages,
@@ -518,14 +586,11 @@ def query_deepseek_api(prompt, context_chunks, leniency=50, model="deepseek-chat
     }
 
     try:
-        r = requests.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers=headers, json=payload, timeout=60
-        )
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        return f"DeepSeek API error: {e}"
+        return f"{provider} API error: {e}"
 
 
 def load_all_pdfs_into_bot(session_id, active_pdfs, messages):
@@ -539,8 +604,7 @@ def load_all_pdfs_into_bot(session_id, active_pdfs, messages):
     # Only need the retriever for indexing — don't force full LLM load
     if st.session_state.bot is None:
         with st.spinner("Setting up retriever..."):
-            st.session_state.bot = _load_retriever_only_bot()
-            st.session_state.bot_model_key = "_retriever_only"
+            st.session_state.bot = _create_bot_shell()
             st.session_state.bot_loaded = True
 
     bot = st.session_state.bot
@@ -995,7 +1059,7 @@ with st.sidebar:
 
     search_query = st.text_input("Search", placeholder="Find a chat...")
 
-    if st.button("+ New Chat", use_container_width=True, type="primary"):
+    if st.button("+ New Chat", width="stretch", type="primary"):
         sid = create_session("New Chat")
         st.session_state.current_session = sid
         st.session_state.papers_loaded_key = None
@@ -1022,7 +1086,7 @@ with st.sidebar:
                     )
                     with st.container(key=title_container_key):
                         if st.button(display_title, key=f"s_{sess['id']}",
-                                     use_container_width=True,
+                                     width="stretch",
                                      help=full_title,
                                      type="secondary"):
                             st.session_state.current_session = sess["id"]
@@ -1031,7 +1095,7 @@ with st.sidebar:
                             st.rerun()
                 with c2:
                     with st.container(key=f"session_delete_{sess['id']}"):
-                        if st.button("🗑️", key=f"d_{sess['id']}", use_container_width=True):
+                        if st.button("🗑️", key=f"d_{sess['id']}", width="stretch"):
                             delete_session(sess["id"])
                             if st.session_state.current_session == sess["id"]:
                                 st.session_state.current_session = None
@@ -1185,7 +1249,7 @@ else:
         cols = st.columns(3)
         for idx, q in enumerate(st.session_state.suggested_questions[:6]):
             with cols[idx % 3]:
-                if st.button(q, key=f"sq_{idx}", use_container_width=True):
+                if st.button(q, key=f"sq_{idx}", width="stretch"):
                     st.session_state.pending_question = q
                     st.rerun()
 
@@ -1227,7 +1291,7 @@ else:
                     v1, v2 = st.columns(2)
                     with v1:
                         st.plotly_chart(create_confidence_gauge(msg["confidence"]),
-                                         use_container_width=True,
+                                         width="stretch",
                                          key=f"chart_conf_{msg['id']}"
                                          )
                         st.caption(f"{msg.get('generation_time', 0):.1f}s | "
@@ -1237,7 +1301,7 @@ else:
                         if fig:
                             st.plotly_chart(
                                 fig,
-                                use_container_width=True,
+                                width="stretch",
                                 key=f"chart_sources_{msg['id']}"
                             )
 
@@ -1247,7 +1311,7 @@ else:
                         if fig:
                             st.plotly_chart(
                                 fig,
-                                use_container_width=True,
+                                width="stretch",
                                 key=f"chart_methodpie_{msg['id']}"
                             )
                     with v4:
@@ -1255,7 +1319,7 @@ else:
                         if fig:
                             st.plotly_chart(
                                 fig,
-                                use_container_width=True,
+                                width="stretch",
                                 key=f"chart_heatmap_{msg['id']}"
                             )
 
@@ -1270,7 +1334,7 @@ else:
                         if fig:
                             st.plotly_chart(
                                 fig,
-                                use_container_width=True,
+                                width="stretch",
                                 key=f"chart_3d_{msg['id']}"
                             )
 
@@ -1280,7 +1344,7 @@ else:
                         if fig:
                             st.plotly_chart(
                                 fig,
-                                use_container_width=True,
+                                width="stretch",
                                 key=f"chart_chunklens_{msg['id']}"
                             )
                     with v6:
@@ -1288,7 +1352,7 @@ else:
                         if fig:
                             st.plotly_chart(
                                 fig,
-                                use_container_width=True,
+                                width="stretch",
                                 key=f"chart_wordcloud_{msg['id']}"
                             )
 
@@ -1471,28 +1535,17 @@ else:
             with st.chat_message("assistant"):
                 with st.spinner(f"{_short} is thinking..."):
                     start_time = time.time()
-                    bot = get_bot(selected_model_key)
+                    bot = get_bot()
 
-                    # Ensure PDFs are indexed on this bot (needed after model swap)
+                    # Ensure PDFs are indexed on this bot (needed on first question)
                     load_all_pdfs_into_bot(session_id, active_pdfs, messages)
 
-                    if model_config.get("is_api"):
-                        # API model: use bot for retrieval, API for generation
-                        retrieved = bot.retriever.retrieve(prompt, top_k=top_k)
-                        answer_text = query_deepseek_api(prompt, retrieved, leniency)
-                        gen_time = time.time() - start_time
-
-                        # Build a response-like object
-                        class _ApiResponse:
-                            pass
-                        response = _ApiResponse()
-                        response.answer = answer_text
-                        response.sources = retrieved
-                        response.confidence = 0.5
-                        response.generation_time = gen_time
-                    else:
-                        # Local model
-                        response = bot.ask(prompt, top_k=top_k, leniency=leniency)
+                    # Load LLM → answer → unload LLM (GPU free between questions)
+                    response = answer_with_model(
+                        bot, selected_model_key, prompt,
+                        top_k=top_k, leniency=leniency,
+                    )
+                    response.generation_time = time.time() - start_time
 
                 st.markdown(response.answer)
 
