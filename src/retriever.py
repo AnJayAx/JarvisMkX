@@ -1,11 +1,14 @@
 """ 
 Hybrid Retrieval Module for Jarvis Mk.X
-Uses: Dense embeddings + ChromaDB (dense) + BM25 (sparse) for hybrid retrieval.
+Uses: Dense embeddings + ChromaDB (dense) + BM25 (sparse) + BGE Reranker for hybrid retrieval.
+
+Pipeline: Query -> Dense + Sparse -> Hybrid Fusion -> BGE Reranker v2 M3 -> Top-K
 
 Changes from v1:
-- Embedding: all-MiniLM-L6-v2 (384-dim) → allenai-specter (768-dim, science-trained)
-- Vector store: FAISS → ChromaDB (persistent, metadata-aware)
-- Retrieval: Dense only → Hybrid (Dense + BM25 with score fusion)
+- Embedding: all-MiniLM-L6-v2 (384-dim) -> allenai-specter (768-dim, science-trained)
+- Vector store: FAISS -> ChromaDB (persistent, metadata-aware)
+- Retrieval: Dense only -> Hybrid (Dense + BM25 with score fusion)
+- Reranking: Added BGE Reranker v2 M3 (cross-encoder, best open-source reranker)
 
 Embedding backends:
 - SentenceTransformers: model_name like "sentence-transformers/allenai-specter"
@@ -13,7 +16,7 @@ Embedding backends:
 
 Usage:
     from retriever import Retriever
-    retriever = Retriever()
+    retriever = Retriever(use_reranker=True)
     retriever.build_index(paper.chunks)
     results = retriever.retrieve("What is attention?", top_k=5)
 """
@@ -168,6 +171,7 @@ class Retriever:
         dense_weight: float = 0.6,
         sparse_weight: float = 0.4,
         voyage_api_key: Optional[str] = None,
+        use_reranker: bool = True,
     ):
         """
         Initialize the hybrid retriever.
@@ -176,16 +180,32 @@ class Retriever:
             model_name: Sentence-transformers model for dense embeddings
             dense_weight: Weight for dense (semantic) scores in fusion (0-1)
             sparse_weight: Weight for sparse (BM25) scores in fusion (0-1)
+            use_reranker: If True, use BGE Reranker v2 M3 for reranking
         """
         self.model_name = model_name
         self.dense_weight = dense_weight
         self.sparse_weight = sparse_weight
+        self.use_reranker = use_reranker
+
+        print("=" * 60)
+        print("  RETRIEVER INITIALIZATION")
+        print("=" * 60)
 
         # Load embedding model (local SentenceTransformers or Voyage API)
         if model_name.strip().lower().startswith("voyage-"):
+            print(f"  Embedding model : {model_name} (API)")
             self.embed_model = _VoyageEmbedder(model_name=model_name, api_key=voyage_api_key)
         else:
+            print(f"  Embedding model : {model_name} (local)")
             self.embed_model = _SentenceTransformerEmbedder(model_name)
+
+        print(f"  Retrieval       : Hybrid (Dense + BM25)")
+        print(f"  Dense weight    : {dense_weight}")
+        print(f"  Sparse weight   : {sparse_weight}")
+        print(f"  Vector store    : ChromaDB (in-memory, cosine)")
+        print(f"  Sparse index    : BM25Okapi")
+        print(f"  Reranker        : {'BGE Reranker v2 M3 (lazy-loaded)' if use_reranker else 'Disabled'}")
+        print("=" * 60)
 
         # Not currently used elsewhere, but handy for debugging.
         self.embedding_dim = None
@@ -196,6 +216,9 @@ class Retriever:
 
         # BM25 index
         self.bm25 = None
+
+        # BGE Reranker (lazy-loaded on first use to avoid slow import at startup)
+        self._reranker = None
 
         # Chunk storage
         self.chunks = None
@@ -208,10 +231,13 @@ class Retriever:
         Args:
             chunks: List of TextChunk objects from PaperProcessor
         """
+        print("-" * 60)
+        print(f"  Building index for {len(chunks)} chunks...")
         self.chunks = chunks
         self.chunk_texts = [chunk.text for chunk in chunks]
 
-        # ─── Dense Index: ChromaDB with SPECTER embeddings ───
+        # ─── Dense Index: ChromaDB with embeddings ───
+        print(f"  [1/2] Dense index (ChromaDB + {self.model_name})...")
 
         # Delete old collection if it exists
         try:
@@ -257,12 +283,17 @@ class Retriever:
             documents=self.chunk_texts,
             metadatas=metadatas,
         )
+        print(f"        ChromaDB: {self.collection.count()} documents indexed")
 
         # ─── Sparse Index: BM25 ───
+        print(f"  [2/2] Sparse index (BM25Okapi)...")
 
         # Tokenize for BM25 (simple whitespace + lowercasing)
         tokenized_chunks = [self._tokenize_for_bm25(text) for text in self.chunk_texts]
         self.bm25 = BM25Okapi(tokenized_chunks)
+        print(f"        BM25: {len(tokenized_chunks)} documents indexed")
+        print(f"  Index ready. Reranker: {'BGE v2 M3 (on first query)' if self.use_reranker else 'disabled'}")
+        print("-" * 60)
 
     def _tokenize_for_bm25(self, text: str) -> List[str]:
         """Simple tokenization for BM25: lowercase, remove punctuation, split."""
@@ -272,22 +303,63 @@ class Retriever:
         # Remove very short tokens
         return [t for t in tokens if len(t) > 1]
 
+    def _get_reranker(self):
+        """Lazy-load cross-encoder reranker on first use."""
+        if self._reranker is None:
+            try:
+                from sentence_transformers import CrossEncoder
+                self._reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
+                print("BGE Reranker v2 M3 loaded (via CrossEncoder)")
+            except Exception as e:
+                print(f"Reranker failed to load ({e}) -- reranking disabled")
+                self.use_reranker = False
+                return None
+        return self._reranker
+
+    def _rerank(self, query: str, results: List[RetrievalResult], top_k: int) -> List[RetrievalResult]:
+        """Rerank results using BGE cross-encoder. Returns top_k reranked results."""
+        reranker = self._get_reranker()
+        if reranker is None or not results:
+            return results[:top_k]
+
+        pairs = [(query, r.text) for r in results]
+        try:
+            scores = reranker.predict(pairs)
+            # Normalize scores to 0-1 range
+            min_s, max_s = float(min(scores)), float(max(scores))
+            if max_s > min_s:
+                norm_scores = [(s - min_s) / (max_s - min_s) for s in scores]
+            else:
+                norm_scores = [0.5] * len(scores)
+            # Sort by reranker score
+            paired = sorted(zip(norm_scores, results), key=lambda x: x[0], reverse=True)
+            reranked = []
+            for rerank_score, result in paired[:top_k]:
+                result.score = 0.6 * float(rerank_score) + 0.4 * result.score
+                result.retrieval_method = result.retrieval_method + "+rerank"
+                reranked.append(result)
+            return reranked
+        except Exception as e:
+            print(f"Reranking failed ({e}) -- returning original order")
+            return results[:top_k]
+
     def retrieve(self, query: str, top_k: int = 5) -> List[RetrievalResult]:
         """
-        Hybrid retrieval: combine dense (ChromaDB) and sparse (BM25) results.
+        Keyword-boosted Hybrid retrieval with BGE reranking.
 
-        Args:
-            query: The user's question
-            top_k: Number of results to return
+        Pipeline (based on Notebook 4 evaluation results):
+            Query -> Dense + Sparse -> Hybrid fusion -> Keyword boost -> BGE Rerank -> Top-K
 
-        Returns:
-            List of RetrievalResult objects sorted by hybrid score
+        NB4 Results:
+            Keyword-boosted Hybrid: MRR 0.813, NDCG 0.740 (best without reranking)
+            + BGE Reranker:         MRR 1.000, NDCG 1.000 (perfect)
         """
         if self.collection is None or self.chunks is None:
             raise ValueError("Index not built. Call build_index() first.")
 
         num_chunks = len(self.chunks)
-        fetch_k = min(top_k * 2, num_chunks)  # Fetch more, then re-rank
+        # Fetch more candidates when reranking (reranker re-scores them)
+        fetch_k = min(top_k * 3 if self.use_reranker else top_k * 2, num_chunks)
 
         # ─── Dense retrieval (ChromaDB) ───
         query_embedding = self.embed_model.encode(
@@ -336,6 +408,20 @@ class Retriever:
                 self.dense_weight * d_score + self.sparse_weight * s_score
             )
 
+        # ─── Keyword boosting (NB4 eval: +0.08 MRR over plain hybrid) ───
+        # Extract key terms from query and boost chunks containing them
+        stopwords = {"what","which","that","this","from","with","does","used",
+                     "how","the","was","were","are","is","can","you","about",
+                     "tell","me","explain","describe","paper","research"}
+        query_terms = [t for t in re.sub(r'[^\w\s]', ' ', query.lower()).split()
+                       if len(t) > 3 and t not in stopwords]
+        if query_terms:
+            for chunk_id in hybrid_scores:
+                if chunk_id < len(self.chunks):
+                    chunk_text = self.chunks[chunk_id].text.lower()
+                    matches = sum(1 for t in query_terms if t in chunk_text)
+                    hybrid_scores[chunk_id] += matches * 0.05
+
         # Sort by hybrid score
         ranked = sorted(hybrid_scores.items(), key=lambda x: x[1], reverse=True)
 
@@ -365,6 +451,17 @@ class Retriever:
                 chunk_type=chunk.chunk_type,
                 retrieval_method=method,
             ))
+
+        # ─── Optional: BGE Reranking ───
+        if self.use_reranker and len(results) > 1:
+            print(f"  [Reranker] BGE v2 M3 reranking {len(results)} candidates -> top {top_k}")
+            results = self._rerank(query, results, top_k)
+        else:
+            results = results[:top_k]
+
+        # Log final results
+        print(f"  [Results] {len(results)} chunks returned "
+              f"(top score: {results[0].score:.3f})" if results else "  [Results] 0 chunks")
 
         return results
 

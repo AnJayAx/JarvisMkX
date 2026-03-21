@@ -395,11 +395,7 @@ MODEL_CONFIGS = {
         "description": "Mistral 7B Instruct via OpenRouter API — no GPU needed",
         "is_api": True,
         "api_provider": "openrouter",
-<<<<<<< HEAD
         "api_model": "mistralai/mistral-7b-instruct",
-=======
-        "api_model": "mistralai/mistral-7b-instruct-v0.1",
->>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
         "min_vram": 0,
     },
     "deepseek_v3_api": {
@@ -488,21 +484,41 @@ def get_bot():
 
 def answer_with_model(bot, model_key, prompt, top_k=5, leniency=50,
                        active_pdfs=None, session_id=None, messages=None):
-    """Load LLM → answer question → unload LLM. GPU is free between calls.
-
-    For API models, no LLM loading is needed — just call the API.
-    For local models, the LLM is loaded, used, and immediately freed.
-    The retriever and PDF index stay in memory (CPU) throughout.
-    """
+    """Load LLM -> answer question -> unload LLM. GPU is free between calls."""
     config = AVAILABLE_MODELS.get(model_key, MODEL_CONFIGS.get(model_key))
+
+    print("\n" + "=" * 60)
+    print("  JARVIS Mk.X -- PROCESSING QUERY")
+    print("=" * 60)
+    print(f"  Model       : {config.get('label', model_key)}")
+    print(f"  Type        : {'API' if config.get('is_api') else 'Local'}")
+    print(f"  Query       : {prompt[:70]}...")
+    print(f"  Top-K       : {top_k}")
+    print(f"  Leniency    : {leniency}")
+    print(f"  History     : {len(bot.conversation_history)} turns")
 
     # ── API model: no LLM needed ────────────────────────────────────────
     if config.get("is_api"):
-        retrieved = bot.retriever.retrieve(prompt, top_k=top_k)
         provider = config.get("api_provider", "deepseek")
         api_model = config.get("api_model", "deepseek-chat")
+        print(f"  Provider    : {provider}")
+        print(f"  API model   : {api_model}")
+        print(f"  [Retrieval] Fetching top-{top_k} chunks...")
+
+        retrieved = bot.retriever.retrieve(prompt, top_k=top_k)
+
+        print(f"  [API Call]  Sending to {provider}...")
         answer_text = query_api(prompt, retrieved, leniency,
-                                provider=provider, model=api_model)
+                                provider=provider, model=api_model,
+                                conversation_history=bot.conversation_history)
+        print(f"  [Done]      Answer received ({len(answer_text)} chars)")
+
+        # Add to conversation history so the bot remembers for follow-up questions
+        from bot import ConversationTurn
+        bot.conversation_history.append(ConversationTurn(role="user", content=prompt))
+        bot.conversation_history.append(ConversationTurn(role="assistant", content=answer_text))
+        if len(bot.conversation_history) > bot.max_history_turns:
+            bot.conversation_history = bot.conversation_history[-bot.max_history_turns:]
 
         class _ApiResponse:
             pass
@@ -511,9 +527,10 @@ def answer_with_model(bot, model_key, prompt, top_k=5, leniency=50,
         response.sources = retrieved
         response.confidence = 0.5
         response.generation_time = 0.0
+        print("=" * 60)
         return response
 
-    # ── Local model: load → answer → unload ─────────────────────────────
+    # ── Local model: load -> answer -> unload ─────────────────────────────
     import gc
 
     # Configure bot for this model
@@ -523,25 +540,33 @@ def answer_with_model(bot, model_key, prompt, top_k=5, leniency=50,
 
     try:
         # Load LLM into VRAM
+        print(f"  [Loading]   LLM into VRAM...")
         bot.load_model()
 
         # Answer the question
+        print(f"  [Retrieval] Fetching chunks + generating answer...")
         response = bot.ask(prompt, top_k=top_k, leniency=leniency)
+        print(f"  [Done]      Answer generated ({len(response.answer)} chars, "
+              f"{response.generation_time:.1f}s)")
 
     finally:
-        # ALWAYS unload — even if generation fails
+        # ALWAYS unload -- even if generation fails
+        print(f"  [Cleanup]   Unloading LLM from VRAM...")
         bot.unload_model()
         gc.collect()
         try:
             torch.cuda.empty_cache()
         except Exception:
             pass
+        print(f"  [Cleanup]   GPU memory freed")
+        print("=" * 60)
 
     return response
 
 
-def query_api(prompt, context_chunks, leniency=50, provider="deepseek", model="deepseek-chat"):
-    """Generate an answer using an API (OpenRouter or DeepSeek) with retrieved context."""
+def query_api(prompt, context_chunks, leniency=50, provider="deepseek", model="deepseek-chat",
+              conversation_history=None):
+    """Generate an answer using an API (OpenRouter or DeepSeek) with retrieved context and conversation history."""
     import requests
 
     context_text = "\n\n".join([
@@ -565,10 +590,24 @@ def query_api(prompt, context_chunks, leniency=50, provider="deepseek", model="d
         "**Sources:**\n- [Section/page references]\n"
     )
 
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": f"### Context from Research Paper:\n{context_text}\n\n### Question:\n{prompt}"},
-    ]
+    messages = [{"role": "system", "content": system_msg}]
+
+    # Include recent conversation history for context (last 10 turns)
+    if conversation_history:
+        for turn in conversation_history[-10:]:
+            role = turn.role if hasattr(turn, "role") else turn.get("role", "user")
+            content = turn.content if hasattr(turn, "content") else turn.get("content", "")
+            messages.append({"role": role, "content": content})
+
+    messages.append({
+        "role": "user",
+        "content": (
+            f"### Context from Research Paper:\n{context_text}\n\n"
+            f"### Question:\n{prompt}\n\n"
+            f"Remember: respond using the format **Answer:**, **Reason:**, **Sources:** (bullet points). "
+            f"Be detailed. If the context does not contain the answer, say so."
+        ),
+    })
 
     if provider == "openrouter":
         api_key = OPENROUTER_API_KEY
@@ -976,11 +1015,7 @@ with st.sidebar:
                             st.rerun()
                 with c2:
                     with st.container(key=f"session_delete_{sess['id']}"):
-<<<<<<< HEAD
                         if st.button("X", key=f"d_{sess['id']}", width="stretch"):
-=======
-                        if st.button("🗑️", key=f"d_{sess['id']}", width="stretch"):
->>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
                             delete_session(sess["id"])
                             if st.session_state.current_session == sess["id"]:
                                 st.session_state.current_session = None
@@ -1541,58 +1576,26 @@ else:
                     v1, v2 = st.columns(2)
                     with v1:
                         st.plotly_chart(create_confidence_gauge(msg["confidence"]),
-<<<<<<< HEAD
                                         width="stretch",
                                         key=f"chart_conf_{msg['id']}")
-=======
-                                         width="stretch",
-                                         key=f"chart_conf_{msg['id']}"
-                                         )
-                        st.caption(f"{msg.get('generation_time', 0):.1f}s | "
-                                   f"{msg.get('retrieval_methods', 'N/A')}")
->>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
                     with v2:
                         fig = create_source_scores_bar(sources)
                         if fig:
-<<<<<<< HEAD
                             st.plotly_chart(fig, width="stretch",
                                             key=f"chart_scores_{msg['id']}")
-=======
-                            st.plotly_chart(
-                                fig,
-                                width="stretch",
-                                key=f"chart_sources_{msg['id']}"
-                            )
->>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
 
                     # ── Row 3: Dense/Sparse breakdown + Answer keywords ────
                     v3, v4 = st.columns(2)
                     with v3:
                         fig = create_method_breakdown(sources)
                         if fig:
-<<<<<<< HEAD
                             st.plotly_chart(fig, width="stretch",
                                             key=f"chart_method_{msg['id']}")
-=======
-                            st.plotly_chart(
-                                fig,
-                                width="stretch",
-                                key=f"chart_methodpie_{msg['id']}"
-                            )
->>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
                     with v4:
                         fig = create_answer_keywords(msg["content"])
                         if fig:
-<<<<<<< HEAD
                             st.plotly_chart(fig, width="stretch",
                                             key=f"chart_keywords_{msg['id']}")
-=======
-                            st.plotly_chart(
-                                fig,
-                                width="stretch",
-                                key=f"chart_heatmap_{msg['id']}"
-                            )
->>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
 
                     # ── Row 4: 3D Vector Space (UMAP/PCA) ─────────────────
                     if sources and len(sources) >= 2:
@@ -1605,36 +1608,10 @@ else:
                         bot = get_bot()
                         fig = create_3d_vector_space(query_text, sources, bot.retriever.embed_model)
                         if fig:
-<<<<<<< HEAD
                             st.plotly_chart(fig, width="stretch",
                                             key=f"chart_3d_{msg['id']}")
 
                     st.divider()
-=======
-                            st.plotly_chart(
-                                fig,
-                                width="stretch",
-                                key=f"chart_3d_{msg['id']}"
-                            )
-
-                    v5, v6 = st.columns(2)
-                    with v5:
-                        fig = create_chunk_length_chart(sources)
-                        if fig:
-                            st.plotly_chart(
-                                fig,
-                                width="stretch",
-                                key=f"chart_chunklens_{msg['id']}"
-                            )
-                    with v6:
-                        fig = create_answer_word_cloud_data(msg["content"])
-                        if fig:
-                            st.plotly_chart(
-                                fig,
-                                width="stretch",
-                                key=f"chart_wordcloud_{msg['id']}"
-                            )
->>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
 
                     # ── Retrieved Chunks (expandable, with full text) ──────
                     if sources:

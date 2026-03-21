@@ -71,7 +71,7 @@ class JarvisBot:
         self.tokenizer = None
         self.current_paper = None
         self.conversation_history = []
-        self.max_history_turns = 6
+        self.max_history_turns = 20  # 10 Q&A pairs
         self.corrections = []
 
         # Auto-detect Qwen3 models (need enable_thinking=False)
@@ -84,13 +84,22 @@ class JarvisBot:
         if self.model is not None:
             print("Model already loaded.")
             return
-        print(f"Loading base model: {self.base_model_name}")
+
+        print("=" * 60)
+        print("  LLM LOADING")
+        print("=" * 60)
+        print(f"  Base model  : {self.base_model_name}")
+        print(f"  Adapter     : {self.adapter_path or 'None'}")
+        print(f"  Qwen3 mode  : {self.is_qwen3}")
+        print(f"  4-bit quant : {self.load_in_4bit}")
 
         # Clear GPU memory before loading (important when swapping models)
         import gc
         gc.collect()
         try:
             torch.cuda.empty_cache()
+            vram_free = torch.cuda.mem_get_info()[0] / 1e9
+            print(f"  GPU free    : {vram_free:.1f} GB")
         except Exception:
             pass
 
@@ -142,7 +151,18 @@ class JarvisBot:
             self.model = base_model
 
         self.model.eval()
-        print(f"✓ Model ready ({self.base_model_name})")
+
+        try:
+            vram_used = torch.cuda.memory_allocated() / 1e9
+            vram_total = torch.cuda.get_device_properties(0).total_memory / 1e9
+            gpu_name = torch.cuda.get_device_name(0)
+            print(f"  GPU         : {gpu_name}")
+            print(f"  VRAM used   : {vram_used:.1f} / {vram_total:.1f} GB")
+        except Exception:
+            pass
+        print("=" * 60)
+        print(f"  LLM READY: {self.base_model_name}")
+        print("=" * 60)
 
     def unload_model(self):
         """Free GPU memory by unloading the LLM (keeps retriever alive)."""
@@ -344,6 +364,13 @@ class JarvisBot:
             )
 
         start_time = time.time()
+
+        # Log the query
+        q_type = self._classify_question(question)
+        print(f"\n  [Query] '{question[:60]}...' " if len(question) > 60 else f"\n  [Query] '{question}'")
+        print(f"  [Type]  {q_type} | top_k={top_k} | leniency={leniency} | max_tokens={max_new_tokens}")
+        print(f"  [History] {len(self.conversation_history)} turns | "
+              f"Corrections: {len(self.corrections)}")
 
         corrections_text = ""
         if self.corrections:
