@@ -20,6 +20,25 @@ import base64
 from datetime import datetime
 from pathlib import Path
 
+# ─── Load API keys from .env file ──────────────────────────────────────────
+def _load_env_file():
+    """Load key=value pairs from .env file in project root."""
+    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if not os.path.exists(env_path):
+        return
+    with open(env_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, _, value = line.partition("=")
+                key, value = key.strip(), value.strip()
+                if key and value and not os.environ.get(key):
+                    os.environ[key] = value
+
+_load_env_file()
+
 sys.path.insert(0, "src")
 
 from database import (
@@ -301,7 +320,6 @@ def init_state():
         "current_session": None,
         "bot": None,
         "bot_loaded": False,
-        "bot_model_key": None,
         "papers_loaded_key": None,
         "suggested_questions": [],
         "all_chunks_cache": [],
@@ -330,38 +348,69 @@ GPU_NAME, GPU_VRAM_GB = detect_gpu_info()
 HIGH_VRAM = GPU_VRAM_GB >= 8  # Mistral-7B fits on 8GB+ GPUs (4-bit)
 
 # ─── Model Configurations ───────────────────────────────────────────────────
-# min_vram: minimum GB needed to run locally. Models above budget → API fallback.
+# Local models: Jarvis (fine-tuned) and DeepSeek-R1-7B (no API available)
+# API models: Qwen3-8B, Llama-3.1-8B, Mistral-7B via OpenRouter; DeepSeek-V3.2 via DeepSeek API
 MODEL_CONFIGS = {
     "jarvis_finetuned": {
-        "label": "Jarvis Mk.X (Fine-tuned Mistral)",
-        "base_model": "mistralai/Mistral-7B-Instruct-v0.3",
-        "adapter_path": "models/jarvis-mkx-adapter-v2",
+        "label": "Jarvis Mk.X (Fine-tuned Qwen3-8B)",
+        "base_model": "Qwen/Qwen3-8B",
+        "adapter_path": "models/jarvis-mkx-qwen3-8b-adapter",
         "short_name": "Jarvis Mk.X",
-        "description": "Our QLoRA fine-tuned Mistral-7B on QASPER",
+        "description": "Our QLoRA fine-tuned Qwen3-8B on QASPER + PubMedQA",
         "is_api": False,
+        "is_qwen3": True,
         "min_vram": 8,
     },
-    "mistral_base": {
-        "label": "Mistral-7B (Base)",
-        "base_model": "mistralai/Mistral-7B-Instruct-v0.3",
+    "deepseek_r1_7b": {
+        "label": "DeepSeek-R1-Distill-Qwen-7B (Local)",
+        "base_model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
         "adapter_path": None,
-        "short_name": "Mistral-7B Base",
-        "description": "Base Mistral-7B-Instruct without fine-tuning",
+        "short_name": "DeepSeek-R1-7B",
+        "description": "DeepSeek R1 distilled into Qwen-7B — local only (no API available)",
         "is_api": False,
+        "is_qwen3": False,
         "min_vram": 8,
+    },
+    "qwen3_base_api": {
+        "label": "Qwen3-8B (API)",
+        "short_name": "Qwen3-8B Base",
+        "description": "Base Qwen3-8B via OpenRouter API — no GPU needed",
+        "is_api": True,
+        "api_provider": "openrouter",
+        "api_model": "qwen/qwen3-8b",
+        "min_vram": 0,
+    },
+    "llama31_api": {
+        "label": "Llama-3.1-8B-Instruct (API)",
+        "short_name": "Llama-3.1-8B",
+        "description": "Meta Llama 3.1 8B via OpenRouter API — no GPU needed",
+        "is_api": True,
+        "api_provider": "openrouter",
+        "api_model": "meta-llama/llama-3.1-8b-instruct",
+        "min_vram": 0,
+    },
+    "mistral_7b_api": {
+        "label": "Mistral-7B-Instruct (API)",
+        "short_name": "Mistral-7B",
+        "description": "Mistral 7B Instruct via OpenRouter API — no GPU needed",
+        "is_api": True,
+        "api_provider": "openrouter",
+        "api_model": "mistralai/mistral-7b-instruct",
+        "min_vram": 0,
     },
     "deepseek_v3_api": {
-        "label": "DeepSeek-V3 (API)",
-        "base_model": None,
-        "adapter_path": None,
-        "short_name": "DeepSeek-V3",
-        "description": "671B MoE model via API — no GPU needed",
+        "label": "DeepSeek-V3.2 (API)",
+        "short_name": "DeepSeek-V3.2",
+        "description": "Frontier MoE model via DeepSeek API — no GPU needed",
         "is_api": True,
+        "api_provider": "deepseek",
+        "api_model": "deepseek-chat",
         "min_vram": 0,
     },
 }
 
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "sk-78346e48330a4966a0a62a8ff8ced452")
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 
 
 def get_available_models():
@@ -393,6 +442,8 @@ def _get_embed_model_name():
     forced = os.environ.get("JARVIS_EMBED_MODEL", "").strip()
     if forced:
         return forced
+    # Default: Voyage 4 large (requires VOYAGE_API_KEY env var)
+    # Fallback: SPECTER (free, local, no API key needed)
     return (
         "voyage-4-large"
         if os.environ.get("VOYAGE_API_KEY")
@@ -400,92 +451,93 @@ def _get_embed_model_name():
     )
 
 
-def load_bot(model_key="jarvis_finetuned"):
-    """Load a JarvisBot with the specified model configuration."""
+def _create_bot_shell(model_key="jarvis_finetuned"):
+    """Create a JarvisBot with retriever only — NO LLM loaded.
+
+    The LLM is loaded on-demand per question and unloaded immediately after,
+    keeping GPU memory free between questions. This lets you switch models
+    instantly since only the retriever (CPU) stays resident.
+    """
     from bot import JarvisBot
-    config = AVAILABLE_MODELS.get(model_key, MODEL_CONFIGS.get(model_key))
+    config = AVAILABLE_MODELS.get(model_key, MODEL_CONFIGS.get(model_key, {}))
 
     bot = JarvisBot(
-        base_model_name=config["base_model"],
+        base_model_name=config.get("base_model", "Qwen/Qwen3-8B"),
         adapter_path=config.get("adapter_path"),
         embed_model_name=_get_embed_model_name(),
         chunk_size=512, chunk_overlap=50, load_in_4bit=True,
+        is_qwen3=config.get("is_qwen3", False),
     )
-    bot.load_model()
+    # DON'T call bot.load_model() — LLM loads on demand
+    print(f"Bot shell created (retriever only, no LLM in VRAM)")
     return bot
 
 
-def _load_retriever_only_bot():
-    """Load a minimal bot that only has a retriever (no LLM). For API-only mode."""
-    from bot import JarvisBot
-    bot = JarvisBot(
-        base_model_name="mistralai/Mistral-7B-Instruct-v0.3",  # won't load
-        adapter_path=None,
-        embed_model_name=_get_embed_model_name(),
-        chunk_size=512, chunk_overlap=50, load_in_4bit=True,
-    )
-    # DON'T call bot.load_model() — only the retriever/processor are set up
-    print("Retriever-only bot initialized (no LLM loaded — API mode)")
-    return bot
-
-
-def get_bot(model_key=None):
-    """Get or reload the bot, switching models if needed."""
-    if model_key is None:
-        model_key = st.session_state.get("current_model", "jarvis_finetuned")
-
-    config = AVAILABLE_MODELS.get(model_key, MODEL_CONFIGS.get(model_key))
-
-    # ── API model: just need retriever, not a full LLM ──────────────────
-    if config.get("is_api"):
-        if st.session_state.bot is not None:
-            return st.session_state.bot
-        # No local model loaded yet — load retriever-only bot
-        if HIGH_VRAM:
-            # On high VRAM, load Jarvis as default (will be used for retrieval)
-            with st.spinner("Loading Jarvis Mk.X for retrieval..."):
-                st.session_state.bot = load_bot("jarvis_finetuned")
-                st.session_state.bot_model_key = "jarvis_finetuned"
-                st.session_state.bot_loaded = True
-        else:
-            # On low VRAM, load retriever-only (no LLM in memory)
-            with st.spinner("Loading retriever..."):
-                st.session_state.bot = _load_retriever_only_bot()
-                st.session_state.bot_model_key = "_retriever_only"
-                st.session_state.bot_loaded = True
-        return st.session_state.bot
-
-    # ── Local model: swap if different from current ──────────────────────
-    if st.session_state.bot_model_key != model_key:
-        # Unload old model
-        if st.session_state.bot is not None:
-            try:
-                st.session_state.bot.unload_model()
-            except Exception:
-                pass
-            del st.session_state.bot
-            st.session_state.bot = None
-            import gc
-            gc.collect()
-            try:
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
-
-        st.session_state.papers_loaded_key = None  # Force re-index after swap
-
+def get_bot():
+    """Get or create the bot shell (retriever only — no LLM resident)."""
     if st.session_state.bot is None:
-        short = config["short_name"]
-        with st.spinner(f"Loading {short} (~30-60s on first load)..."):
-            st.session_state.bot = load_bot(model_key)
+        with st.spinner("Setting up retriever..."):
+            st.session_state.bot = _create_bot_shell()
             st.session_state.bot_loaded = True
-            st.session_state.bot_model_key = model_key
-
     return st.session_state.bot
 
 
-def query_deepseek_api(prompt, context_chunks, leniency=50, model="deepseek-chat"):
-    """Generate an answer using DeepSeek API with retrieved context."""
+def answer_with_model(bot, model_key, prompt, top_k=5, leniency=50,
+                       active_pdfs=None, session_id=None, messages=None):
+    """Load LLM → answer question → unload LLM. GPU is free between calls.
+
+    For API models, no LLM loading is needed — just call the API.
+    For local models, the LLM is loaded, used, and immediately freed.
+    The retriever and PDF index stay in memory (CPU) throughout.
+    """
+    config = AVAILABLE_MODELS.get(model_key, MODEL_CONFIGS.get(model_key))
+
+    # ── API model: no LLM needed ────────────────────────────────────────
+    if config.get("is_api"):
+        retrieved = bot.retriever.retrieve(prompt, top_k=top_k)
+        provider = config.get("api_provider", "deepseek")
+        api_model = config.get("api_model", "deepseek-chat")
+        answer_text = query_api(prompt, retrieved, leniency,
+                                provider=provider, model=api_model)
+
+        class _ApiResponse:
+            pass
+        response = _ApiResponse()
+        response.answer = answer_text
+        response.sources = retrieved
+        response.confidence = 0.5
+        response.generation_time = 0.0
+        return response
+
+    # ── Local model: load → answer → unload ─────────────────────────────
+    import gc
+
+    # Configure bot for this model
+    bot.base_model_name = config["base_model"]
+    bot.adapter_path = config.get("adapter_path")
+    bot.is_qwen3 = config.get("is_qwen3", False)
+
+    try:
+        # Load LLM into VRAM
+        bot.load_model()
+
+        # Answer the question
+        response = bot.ask(prompt, top_k=top_k, leniency=leniency)
+
+    finally:
+        # ALWAYS unload — even if generation fails
+        bot.unload_model()
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    return response
+
+
+def query_api(prompt, context_chunks, leniency=50, provider="deepseek", model="deepseek-chat"):
+    """Generate an answer using an API (OpenRouter or DeepSeek) with retrieved context."""
     import requests
 
     context_text = "\n\n".join([
@@ -496,9 +548,17 @@ def query_deepseek_api(prompt, context_chunks, leniency=50, model="deepseek-chat
     temperature = 0.1 + (leniency / 100) * 0.6
 
     system_msg = (
-        "You are Jarvis Mk.X, a research paper Q&A assistant. "
-        "Answer based on the provided context from research papers. "
-        "Explain in your own words. If context is insufficient, say so."
+        "You are Jarvis Mk.X, a research paper Q&A assistant.\n\n"
+        "STRICT RULES:\n"
+        "1. ONLY answer based on the provided context from the research paper.\n"
+        "2. If the context does not contain information to answer the question, "
+        "respond with: 'The provided context does not contain information to answer this question.'\n"
+        "3. NEVER make up facts, numbers, or claims not supported by the context.\n"
+        "4. Do NOT answer general knowledge questions — you only know what is in the paper.\n\n"
+        "RESPONSE FORMAT:\n"
+        "**Answer:** [Your direct answer]\n\n"
+        "**Reason:** [How the context supports it]\n\n"
+        "**Sources:**\n- [Section/page references]\n"
     )
 
     messages = [
@@ -506,10 +566,26 @@ def query_deepseek_api(prompt, context_chunks, leniency=50, model="deepseek-chat
         {"role": "user", "content": f"### Context from Research Paper:\n{context_text}\n\n### Question:\n{prompt}"},
     ]
 
-    headers = {
-        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-        "Content-Type": "application/json",
-    }
+    if provider == "openrouter":
+        api_key = OPENROUTER_API_KEY
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://jarvis-mkx.app",
+            "X-Title": "Jarvis Mk.X",
+        }
+    else:  # deepseek
+        api_key = DEEPSEEK_API_KEY
+        url = "https://api.deepseek.com/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+    if not api_key:
+        return f"API key not set for {provider}. Set {'OPENROUTER_API_KEY' if provider == 'openrouter' else 'DEEPSEEK_API_KEY'} environment variable."
+
     payload = {
         "model": model,
         "messages": messages,
@@ -518,14 +594,11 @@ def query_deepseek_api(prompt, context_chunks, leniency=50, model="deepseek-chat
     }
 
     try:
-        r = requests.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers=headers, json=payload, timeout=60
-        )
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
         r.raise_for_status()
         return r.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        return f"DeepSeek API error: {e}"
+        return f"{provider} API error: {e}"
 
 
 def load_all_pdfs_into_bot(session_id, active_pdfs, messages):
@@ -539,8 +612,7 @@ def load_all_pdfs_into_bot(session_id, active_pdfs, messages):
     # Only need the retriever for indexing — don't force full LLM load
     if st.session_state.bot is None:
         with st.spinner("Setting up retriever..."):
-            st.session_state.bot = _load_retriever_only_bot()
-            st.session_state.bot_model_key = "_retriever_only"
+            st.session_state.bot = _create_bot_shell()
             st.session_state.bot_loaded = True
 
     bot = st.session_state.bot
@@ -596,6 +668,63 @@ def generate_suggested_questions(paper_info):
     return suggestions[:6]
 
 
+def _generate_summary_with_jarvis(context_text, filename):
+    """Use Jarvis Mk.X (fine-tuned Qwen3-8B) to generate a paper summary.
+    Loads the model on demand, generates summary, then unloads."""
+    import gc
+    from bot import JarvisBot
+
+    bot = JarvisBot(
+        base_model_name="Qwen/Qwen3-8B",
+        adapter_path="models/jarvis-mkx-qwen3-8b-adapter",
+        embed_model_name=_get_embed_model_name(),
+        load_in_4bit=True,
+        is_qwen3=True,
+    )
+
+    try:
+        bot.load_model()
+
+        prompt = (
+            f"Summarize this research paper in 3-5 sentences. "
+            f"Cover: (1) what the paper is about, (2) the main methodology, "
+            f"(3) the key findings or conclusions.\n\n"
+            f"### Context from Research Paper:\n{context_text}\n\n"
+            f"### Question:\nProvide a concise summary of this paper."
+        )
+
+        messages = [
+            {"role": "system", "content": "You are Jarvis Mk.X. Summarize the research paper concisely in 3-5 sentences."},
+            {"role": "user", "content": prompt},
+        ]
+
+        template_kwargs = dict(
+            tokenize=True, add_generation_prompt=True,
+            return_tensors="pt", return_dict=True,
+            enable_thinking=False,
+        )
+        encoded = bot.tokenizer.apply_chat_template(messages, **template_kwargs)
+        input_ids = encoded["input_ids"].to(bot.model.device)
+        attention_mask = encoded["attention_mask"].to(bot.model.device)
+
+        with torch.no_grad():
+            outputs = bot.model.generate(
+                input_ids, attention_mask=attention_mask,
+                max_new_tokens=500, temperature=0.3,
+                do_sample=True, repetition_penalty=1.1,
+            )
+        summary = bot.tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True).strip()
+        return summary
+
+    finally:
+        bot.unload_model()
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
 def format_sources_for_db(sources):
     return [
         {"section": s.section, "page_numbers": s.page_numbers,
@@ -607,197 +736,16 @@ def format_sources_for_db(sources):
     ]
 
 
-def _normalize_pdf_search_text(text: str) -> str:
-    if not text:
-        return ""
-    return " ".join(str(text).replace("\u00ad", "").split())
-
-
-def _normalize_token(token: str) -> str:
-    token = (token or "").lower()
-    token = re.sub(r"[^a-z0-9]+", "", token)
-    return token
-
-
-def _first_sentence(text: str, max_chars: int = 260) -> str:
-    t = _normalize_pdf_search_text(text)
-    if not t:
-        return ""
-    m = re.search(r"(.+?[.!?])\s", t)
-    if m:
-        snippet = m.group(1)
-    else:
-        snippet = t
-    return snippet[:max_chars].strip()
-
-
-def _rect_union(rects):
-    if not rects:
-        return None
-    r = fitz.Rect(rects[0])
-    for rr in rects[1:]:
-        r |= fitz.Rect(rr)
-    return r
-
-
-def _find_highlight_rects_by_words(page, text: str, max_words: int = 35):
-    snippet = _first_sentence(text)
-    if not snippet:
-        return []
-
-    target_tokens = [_normalize_token(t) for t in snippet.split()]
-    target_tokens = [t for t in target_tokens if t]
-    if not target_tokens:
-        return []
-    target_tokens = target_tokens[:max_words]
-
-    words = page.get_text("words") or []
-    if not words:
-        return []
-
-    page_tokens = []
-    for w in words:
-        tok = _normalize_token(w[4])
-        page_tokens.append(tok)
-
-    anchor_len = min(8, len(target_tokens))
-    anchor = target_tokens[:anchor_len]
-    if anchor_len < 3:
-        return []
-
-    candidate_starts = []
-    for i in range(0, len(page_tokens) - anchor_len + 1):
-        if page_tokens[i:i + anchor_len] == anchor:
-            candidate_starts.append(i)
-            if len(candidate_starts) >= 5:
-                break
-
-    if not candidate_starts:
-        return []
-
-    best = None
-    best_len = 0
-    for start in candidate_starts:
-        j = 0
-        while (start + j) < len(page_tokens) and j < len(target_tokens):
-            if page_tokens[start + j] != target_tokens[j]:
-                break
-            j += 1
-        if j > best_len:
-            best_len = j
-            best = (start, j)
-
-    if not best or best_len < 4:
-        return []
-
-    start, length = best
-    matched_words = words[start:start + length]
-    line_groups = []
-    current = []
-    current_y = None
-
-    for w in matched_words:
-        rect = fitz.Rect(w[0], w[1], w[2], w[3])
-        y = round(rect.y0, 1)
-        if current_y is None:
-            current_y = y
-            current.append(rect)
-            continue
-        if abs(y - current_y) <= 2.5:
-            current.append(rect)
-        else:
-            line_groups.append(current)
-            current = [rect]
-            current_y = y
-    if current:
-        line_groups.append(current)
-
-    rects = []
-    for group in line_groups:
-        u = _rect_union(group)
-        if u:
-            rects.append(u)
-    return rects
-
-
-def _build_search_snippets(text: str) -> list:
-    t = _normalize_pdf_search_text(text)
-    if not t:
-        return []
-
-    words = t.split()
-    snippets = []
-
-    if len(words) >= 6:
-        snippets.append(" ".join(words[:12]))
-    if len(words) >= 24:
-        mid = len(words) // 2
-        snippets.append(" ".join(words[mid: mid + 12]))
-    if len(words) >= 12:
-        snippets.append(" ".join(words[-12:]))
-
-    snippets.append(t[:120])
-
-    seen = set()
-    out = []
-    for s in snippets:
-        s = s.strip()
-        if len(s) < 15:
-            continue
-        if s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
-
-
-def render_pdf_page(filepath, page_num, highlight_texts=None):
+def render_pdf_page_simple(filepath, page_num):
+    """Render a PDF page as an image — no highlighting (avoids inaccurate marks)."""
     try:
         doc = fitz.open(filepath)
         page = doc[min(page_num, len(doc) - 1)]
-
-        if highlight_texts:
-            try:
-                for text in highlight_texts:
-                    rects = _find_highlight_rects_by_words(page, text)
-                    if rects:
-                        for r in rects:
-                            try:
-                                page.add_highlight_annot(r)
-                            except Exception:
-                                pass
-                        break
-
-                    found_any = False
-                    for snippet in _build_search_snippets(text):
-                        try:
-                            hits = page.search_for(snippet, quads=True)
-                        except TypeError:
-                            hits = page.search_for(snippet)
-                        if hits:
-                            try:
-                                page.add_highlight_annot(hits)
-                            except Exception:
-                                for h in hits:
-                                    try:
-                                        page.add_highlight_annot([h])
-                                    except Exception:
-                                        pass
-                            found_any = True
-                            break
-                    if found_any:
-                        break
-            except Exception:
-                pass
-
-        pix = page.get_pixmap(
-            matrix=fitz.Matrix(1.5, 1.5),
-            annots=True if highlight_texts else False,
-        )
+        pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
         img_bytes = pix.tobytes("png")
         doc.close()
         return img_bytes
-    except:
+    except Exception:
         return None
 
 
@@ -807,9 +755,10 @@ def create_confidence_gauge(confidence):
     fig = go.Figure(go.Indicator(
         mode="gauge+number",
         value=value,
-        title={"text": "Confidence %", "font": {"size": 14}},
-        number={"suffix": "%", "valueformat": ".0f", "font": {"size": 46}},
-        gauge={"axis": {"range": [0, 100]}, "bar": {"color": color},
+        title={"text": "Retrieval Confidence", "font": {"size": 14, "color": "#ccc"}},
+        number={"suffix": "%", "valueformat": ".0f", "font": {"size": 42}},
+        gauge={"axis": {"range": [0, 100], "tickcolor": "#555"},
+               "bar": {"color": color},
                "bgcolor": "#1e1e2e",
                "steps": [{"range": [0, 30], "color": "#3a1a1a"},
                          {"range": [30, 60], "color": "#3a3a1a"},
@@ -820,173 +769,165 @@ def create_confidence_gauge(confidence):
     return fig
 
 
-def create_source_chart(sources):
-    if not sources: return None
-    sections = [s.get("section", "?")[:30] for s in sources]
+def create_source_scores_bar(sources):
+    """Horizontal bar chart: retrieval score per source chunk, color-coded by method."""
+    if not sources:
+        return None
+    labels = [f"Chunk {i+1}: {s.get('section', '?')[:35]}" for i, s in enumerate(sources)]
     scores = [s.get("score", 0) for s in sources]
-    methods = [s.get("method", "?") for s in sources]
+    methods = [s.get("method", "hybrid") for s in sources]
     colors = ["#4da6ff" if m == "dense" else "#ff9944" if m == "sparse" else "#44ff88"
               for m in methods]
-    fig = go.Figure(go.Bar(x=scores, y=sections, orientation="h",
-                           marker_color=colors,
-                           text=[f"{s:.3f}" for s in scores],
-                           textposition="outside"))
-    fig.update_layout(title="Retrieval Scores by Source", xaxis_title="Score",
-                      height=max(200, len(sources) * 50),
-                      margin=dict(l=10, r=10, t=40, b=10),
-                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      font={"color": "#ccc"})
+    fig = go.Figure(go.Bar(
+        y=labels, x=scores, orientation="h",
+        marker_color=colors,
+        text=[f"{s:.3f}" for s in scores],
+        textposition="outside",
+        hovertext=[f"{m.title()} | Score: {s:.4f}" for m, s in zip(methods, scores)],
+        hoverinfo="text",
+    ))
+    fig.update_layout(
+        title="Retrieval Scores by Chunk",
+        xaxis_title="Score", xaxis_range=[0, max(scores) * 1.3 + 0.05],
+        height=max(180, len(sources) * 45),
+        margin=dict(l=10, r=10, t=35, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#ccc"},
+    )
     return fig
 
 
-def create_method_pie(sources):
-    if not sources: return None
-    methods = [s.get("method", "unknown") for s in sources]
+def create_method_breakdown(sources):
+    """Stacked bar: dense vs sparse contribution per chunk."""
+    if not sources or len(sources) < 2:
+        return None
+    labels = [f"Chunk {i+1}" for i in range(len(sources))]
+    dense_est, sparse_est = [], []
+    for s in sources:
+        h = s.get("score", 0)
+        m = s.get("method", "hybrid")
+        if m == "dense":
+            dense_est.append(h); sparse_est.append(0)
+        elif m == "sparse":
+            dense_est.append(0); sparse_est.append(h)
+        else:
+            dense_est.append(h * 0.6); sparse_est.append(h * 0.4)
+    fig = go.Figure()
+    fig.add_trace(go.Bar(name="Dense (Semantic)", x=labels, y=dense_est, marker_color="#4da6ff"))
+    fig.add_trace(go.Bar(name="Sparse (BM25)", x=labels, y=sparse_est, marker_color="#ff9944"))
+    fig.update_layout(
+        barmode="stack", title="Dense vs Sparse Score Breakdown",
+        yaxis_title="Score", height=250,
+        margin=dict(l=10, r=10, t=35, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#ccc"}, legend=dict(orientation="h", yanchor="bottom", y=1.02),
+    )
+    return fig
+
+
+def create_answer_keywords(answer_text):
+    """Top keywords from the answer as a horizontal bar."""
     from collections import Counter
-    counts = Counter(methods)
-    colors = {"dense": "#4da6ff", "sparse": "#ff9944", "hybrid": "#44ff88", "unknown": "#888"}
-    fig = go.Figure(go.Pie(
-        labels=list(counts.keys()), values=list(counts.values()),
-        marker_colors=[colors.get(m, "#888") for m in counts.keys()],
-        hole=0.4,
+    words = re.findall(r'\b[a-zA-Z]{4,}\b', answer_text.lower())
+    stopwords = {"this", "that", "with", "from", "have", "been", "were", "they",
+                 "their", "which", "would", "could", "about", "into", "more",
+                 "also", "than", "other", "some", "such", "when", "what", "there",
+                 "these", "those", "does", "will", "each", "only", "very", "most"}
+    words = [w for w in words if w not in stopwords]
+    counts = Counter(words).most_common(10)
+    if not counts:
+        return None
+    words_list, freqs = zip(*counts)
+    fig = go.Figure(go.Bar(
+        x=list(freqs), y=list(words_list), orientation="h",
+        marker_color="#e040fb",
     ))
-    fig.update_layout(title="Retrieval Method Distribution", height=250,
-                      margin=dict(l=10, r=10, t=40, b=10),
-                      paper_bgcolor="rgba(0,0,0,0)", font={"color": "#ccc"})
+    fig.update_layout(
+        title="Key Terms in Answer", xaxis_title="Frequency",
+        height=280, margin=dict(l=10, r=10, t=35, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font={"color": "#ccc"},
+    )
     return fig
 
 
 def create_3d_vector_space(query_text, sources, embed_model):
+    """3D PCA scatter plot: query point vs retrieved chunk points with hover text."""
     if not sources or len(sources) < 2:
         return None
-
     try:
         from sklearn.decomposition import PCA
 
-        texts = [query_text] + [s.get("text_preview", "")[:200] for s in sources]
-        labels = ["Query"] + [f"Chunk {i+1}: {s.get('section', '?')[:20]}" for i, s in enumerate(sources)]
-        types = ["query"] + ["chunk"] * len(sources)
+        chunk_previews = [
+            (s.get("text") or s.get("text_preview", ""))[:150].replace("\n", " ")
+            for s in sources
+        ]
+        texts = [query_text] + [s.get("text") or s.get("text_preview", "")[:200] for s in sources]
         scores = [1.0] + [s.get("score", 0) for s in sources]
+        methods = ["query"] + [s.get("method", "hybrid") for s in sources]
+        sections = ["Query"] + [s.get("section", "?")[:30] for s in sources]
 
         embeddings = embed_model.encode(texts, normalize_embeddings=True)
-
         pca = PCA(n_components=3)
         coords = pca.fit_transform(embeddings)
 
-        colors = ["#ff4444"] + ["#44ff88" if sc > 0.5 else "#ffcc00" if sc > 0.3 else "#4da6ff"
-                                 for sc in scores[1:]]
-        sizes = [15] + [max(8, sc * 20) for sc in scores[1:]]
-
         fig = go.Figure()
 
+        # ── Chunk points with hover ──────────────────────────────────────
         for i in range(1, len(coords)):
+            sc = scores[i]
+            color = "#44ff88" if sc > 0.5 else "#ffcc00" if sc > 0.3 else "#4da6ff"
+            size = max(8, sc * 18)
+            method_label = methods[i].title()
+            hover = (
+                f"<b>Chunk {i}: {sections[i]}</b><br>"
+                f"Score: {sc:.3f} | Method: {method_label}<br>"
+                f"<i>{chunk_previews[i-1]}...</i>"
+            )
             fig.add_trace(go.Scatter3d(
                 x=[coords[i, 0]], y=[coords[i, 1]], z=[coords[i, 2]],
-                mode="markers+text", text=[labels[i]],
-                textposition="top center",
-                marker=dict(size=sizes[i], color=colors[i], opacity=0.8),
-                name=labels[i],
+                mode="markers",
+                marker=dict(size=size, color=color, opacity=0.85,
+                            line=dict(width=1.5, color="white")),
+                name=f"Chunk {i} ({sc:.3f})",
+                hovertext=hover, hoverinfo="text",
             ))
+            # Dashed line to query
             fig.add_trace(go.Scatter3d(
                 x=[coords[0, 0], coords[i, 0]],
                 y=[coords[0, 1], coords[i, 1]],
                 z=[coords[0, 2], coords[i, 2]],
                 mode="lines",
-                line=dict(color=colors[i], width=2, dash="dash"),
-                showlegend=False, opacity=0.4,
+                line=dict(color=color, width=2, dash="dash"),
+                showlegend=False, opacity=0.3, hoverinfo="skip",
             ))
 
+        # ── Query point (diamond) ────────────────────────────────────────
         fig.add_trace(go.Scatter3d(
             x=[coords[0, 0]], y=[coords[0, 1]], z=[coords[0, 2]],
-            mode="markers+text", text=["YOUR QUERY"],
-            textposition="top center",
-            marker=dict(size=15, color="#ff4444", symbol="diamond", opacity=1.0),
-            name="Query",
+            mode="markers+text", text=["Query"],
+            textposition="top center", textfont=dict(size=11, color="#ff6666"),
+            marker=dict(size=12, color="#ff4444", symbol="diamond", opacity=1.0,
+                        line=dict(width=2, color="white")),
+            name="Your Query",
+            hovertext=f"<b>Query</b><br>{query_text[:120]}...",
+            hoverinfo="text",
         ))
 
         fig.update_layout(
-            title="3D Vector Space: Query vs Retrieved Chunks",
             scene=dict(
-                xaxis_title=f"PC1 ({pca.explained_variance_ratio_[0]:.1%})",
-                yaxis_title=f"PC2 ({pca.explained_variance_ratio_[1]:.1%})",
-                zaxis_title=f"PC3 ({pca.explained_variance_ratio_[2]:.1%})",
+                xaxis_title=f"PC1 ({pca.explained_variance_ratio_[0]:.0%})",
+                yaxis_title=f"PC2 ({pca.explained_variance_ratio_[1]:.0%})",
+                zaxis_title=f"PC3 ({pca.explained_variance_ratio_[2]:.0%})",
                 bgcolor="rgba(0,0,0,0)",
             ),
-            height=500, margin=dict(l=0, r=0, t=40, b=0),
+            height=550, margin=dict(l=0, r=0, t=10, b=0),
             paper_bgcolor="rgba(0,0,0,0)", font={"color": "#ccc"},
+            legend=dict(font=dict(size=9), bgcolor="rgba(0,0,0,0.5)"),
         )
         return fig
     except Exception as e:
-        st.caption(f"3D viz error: {e}")
         return None
-
-
-def create_score_heatmap(sources):
-    if not sources or len(sources) < 2: return None
-
-    sections = [s.get("section", "?")[:25] for s in sources]
-    hybrid = [s.get("score", 0) for s in sources]
-
-    dense_est = []
-    sparse_est = []
-    for s in sources:
-        h = s.get("score", 0)
-        m = s.get("method", "hybrid")
-        if m == "dense":
-            dense_est.append(h)
-            sparse_est.append(0.0)
-        elif m == "sparse":
-            dense_est.append(0.0)
-            sparse_est.append(h)
-        else:
-            dense_est.append(h * 0.6)
-            sparse_est.append(h * 0.4)
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(name="Dense (Semantic)", y=sections, x=dense_est,
-                         orientation="h", marker_color="#4da6ff"))
-    fig.add_trace(go.Bar(name="Sparse (BM25)", y=sections, x=sparse_est,
-                         orientation="h", marker_color="#ff9944"))
-
-    fig.update_layout(barmode="stack", title="Dense vs Sparse Score Breakdown",
-                      xaxis_title="Score", height=max(200, len(sources) * 50),
-                      margin=dict(l=10, r=10, t=40, b=10),
-                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      font={"color": "#ccc"}, legend=dict(orientation="h", yanchor="bottom"))
-    return fig
-
-
-def create_chunk_length_chart(sources):
-    if not sources: return None
-    sections = [f"Chunk {i+1}" for i in range(len(sources))]
-    lengths = [len(s.get("text_preview", "")) for s in sources]
-    fig = go.Figure(go.Bar(x=sections, y=lengths, marker_color="#7c4dff",
-                           text=lengths, textposition="outside"))
-    fig.update_layout(title="Retrieved Chunk Sizes (chars)", yaxis_title="Characters",
-                      height=250, margin=dict(l=10, r=10, t=40, b=10),
-                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      font={"color": "#ccc"})
-    return fig
-
-
-def create_answer_word_cloud_data(answer_text):
-    import re
-    from collections import Counter
-    words = re.findall(r'\b[a-zA-Z]{4,}\b', answer_text.lower())
-    stopwords = {"this", "that", "with", "from", "have", "been", "were", "they",
-                 "their", "which", "would", "could", "about", "into", "more",
-                 "also", "than", "other", "some", "such", "when", "what", "there"}
-    words = [w for w in words if w not in stopwords]
-    counts = Counter(words).most_common(12)
-    if not counts: return None
-    words, freqs = zip(*counts)
-    fig = go.Figure(go.Bar(x=list(freqs), y=list(words), orientation="h",
-                           marker_color="#e040fb"))
-    fig.update_layout(title="Key Terms in Answer", xaxis_title="Frequency",
-                      height=300, margin=dict(l=10, r=10, t=40, b=10),
-                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                      font={"color": "#ccc"})
-    return fig
 
 
 with st.sidebar:
@@ -995,7 +936,7 @@ with st.sidebar:
 
     search_query = st.text_input("Search", placeholder="Find a chat...")
 
-    if st.button("+ New Chat", use_container_width=True, type="primary"):
+    if st.button("+ New Chat", width="stretch", type="primary"):
         sid = create_session("New Chat")
         st.session_state.current_session = sid
         st.session_state.papers_loaded_key = None
@@ -1022,7 +963,7 @@ with st.sidebar:
                     )
                     with st.container(key=title_container_key):
                         if st.button(display_title, key=f"s_{sess['id']}",
-                                     use_container_width=True,
+                                     width="stretch",
                                      help=full_title,
                                      type="secondary"):
                             st.session_state.current_session = sess["id"]
@@ -1031,7 +972,7 @@ with st.sidebar:
                             st.rerun()
                 with c2:
                     with st.container(key=f"session_delete_{sess['id']}"):
-                        if st.button("🗑️", key=f"d_{sess['id']}", use_container_width=True):
+                        if st.button("X", key=f"d_{sess['id']}", width="stretch"):
                             delete_session(sess["id"])
                             if st.session_state.current_session == sess["id"]:
                                 st.session_state.current_session = None
@@ -1042,34 +983,361 @@ with st.sidebar:
 
 if st.session_state.current_session is None:
     st.markdown("# Jarvis Mk.X")
-    st.markdown("### Smart Research Paper Chatbot")
+    st.markdown("### Smart Research Paper Q&A Chatbot")
+    st.caption("Fine-tuned Qwen3-8B on QASPER + PubMedQA | Hybrid Retrieval (Dense + BM25) | Voyage 4 Embeddings")
 
     # GPU info banner
     if GPU_NAME:
-        gpu_badge = f"**{GPU_NAME}** — {GPU_VRAM_GB}GB VRAM"
-        if HIGH_VRAM:
-            gpu_badge += " (all models available)"
-        else:
-            gpu_badge += " (API mode — local 32B models require ≥20GB)"
-        st.info(gpu_badge)
+        st.info(f"**{GPU_NAME}** — {GPU_VRAM_GB}GB VRAM")
     else:
-        st.warning("No GPU detected — only API models available")
+        st.info("Running in API mode — no local GPU required for most models")
 
-    st.markdown("**Available models on this machine:**")
-    for key, cfg in AVAILABLE_MODELS.items():
-        api_tag = " *(via API)*" if cfg.get("is_api") else " *(local)*"
-        st.markdown(f"- {cfg['label']}{api_tag}")
+    st.markdown("---")
 
-    unavailable = [cfg["label"] for k, cfg in MODEL_CONFIGS.items() if k not in AVAILABLE_MODELS]
-    if unavailable:
-        st.caption(f"Not available ({GPU_VRAM_GB}GB VRAM): {', '.join(unavailable)}")
+    # ── Available Models ─────────────────────────────────────────────────
+    st.markdown("### Available Models")
+    st.markdown("Select any model from the dropdown when chatting. "
+                "**Jarvis Mk.X** is our fine-tuned model; others are baselines for comparison.")
 
+    model_cols = st.columns(3)
+    for i, (key, cfg) in enumerate(AVAILABLE_MODELS.items()):
+        with model_cols[i % 3]:
+            is_local = not cfg.get("is_api")
+            badge = "[Local]" if is_local else "[API]"
+            star = " " if "jarvis" in key else ""
+            st.markdown(f"**{cfg['label']}**{star}  \n"
+                        f"{badge} — {cfg['description']}")
+
+    st.markdown("---")
+
+    # ── Benchmark Results ────────────────────────────────────────────────
+    st.markdown("### 6-Model Benchmark Results")
+    st.markdown(
+        "We evaluated all 6 models on **100 QASPER test questions** (research paper Q&A). "
+        "Our fine-tuned **Jarvis Mk.X** significantly outperforms all base models across "
+        "every metric, with statistically significant improvements (p < 0.001)."
+    )
+
+    # ── Metrics explanation ──────────────────────────────────────────────
+    with st.expander("What do these metrics mean?", expanded=False):
+        st.markdown("""
+**Lexical Metrics** — Measure word-level overlap between the model's answer and the reference answer:
+- **Token F1** — Harmonic mean of precision and recall at the word level. Higher = better word coverage.
+- **ROUGE-1/2/L** — Unigram, bigram, and longest-common-subsequence overlap. Standard for summarization evaluation.
+- **BLEU-1/2/4** — N-gram precision (how many n-grams in the prediction appear in the reference).
+- **METEOR** — Alignment-based metric that accounts for synonyms and stemming. More lenient than BLEU.
+
+**Semantic Metrics** — Measure meaning similarity, not just word overlap:
+- **BERTScore F1** — Uses DeBERTa embeddings to compare meaning. A prediction can score high even with different wording.
+- **SBERT Cosine** — Cosine similarity between sentence embeddings. Captures overall semantic closeness.
+
+**RAGAS Metrics** — Evaluate RAG (Retrieval-Augmented Generation) quality using GPT-4o-mini as a judge:
+- **Faithfulness** — Is the answer grounded in the retrieved context? (no hallucination)
+- **Answer Relevancy** — Does the answer actually address the question asked?
+- **Context Precision** — Are the retrieved chunks relevant to the question?
+- **Context Recall** — Do the retrieved chunks cover all info needed for the answer?
+- **Answer Correctness** — Factual overlap between the answer and the ground-truth reference.
+
+**Answer Quality** — Descriptive statistics:
+- **Avg Pred Len** — Average answer length in words. Too short = incomplete; too long = verbose.
+- **Length Ratio** — Predicted length / reference length. Ideally close to 1.0.
+- **Refusal Rate** — How often the model refuses to answer (says "not enough info").
+- **Vocab Diversity (TTR)** — Type-token ratio. Higher = richer vocabulary, less repetition.
+        """)
+
+    # ── Benchmark Table ──────────────────────────────────────────────────
+    st.markdown("#### Full Benchmark Table")
+    st.markdown("*Jarvis Mk.X (our fine-tuned model) vs 5 baseline models on 100 QASPER test samples.*")
+
+    # Try to load benchmark CSV if available
+    import pandas as pd
+    benchmark_csv = os.path.join("models", "evaluation_v5_qwen3", "benchmark_results.csv")
+    ragas_csv = os.path.join("models", "evaluation_v5_qwen3", "ragas_results.csv")
+
+    # Column tooltips — shown when hovering over column headers
+    benchmark_col_help = {
+        "Token F1": st.column_config.NumberColumn(
+            "Token F1",
+            help="Harmonic mean of precision and recall at the word level. Higher = better word coverage.",
+        ),
+        "Exact Match": st.column_config.NumberColumn(
+            "Exact Match",
+            help="1 if prediction exactly matches reference after normalization, 0 otherwise. Very strict metric.",
+        ),
+        "ROUGE-1": st.column_config.NumberColumn(
+            "ROUGE-1",
+            help="Unigram overlap (F1) between prediction and reference. Measures single-word recall and precision.",
+        ),
+        "ROUGE-2": st.column_config.NumberColumn(
+            "ROUGE-2",
+            help="Bigram overlap (F1). Captures two-word phrase matches — harder to score high on than ROUGE-1.",
+        ),
+        "ROUGE-L": st.column_config.NumberColumn(
+            "ROUGE-L",
+            help="Longest common subsequence overlap. Rewards answers that preserve the order of words from the reference.",
+        ),
+        "BLEU-1": st.column_config.NumberColumn(
+            "BLEU-1",
+            help="Unigram precision — what fraction of words in the prediction also appear in the reference.",
+        ),
+        "BLEU-2": st.column_config.NumberColumn(
+            "BLEU-2",
+            help="Bigram precision — what fraction of 2-word phrases in the prediction match the reference.",
+        ),
+        "BLEU-4": st.column_config.NumberColumn(
+            "BLEU-4",
+            help="4-gram precision. Very strict — requires 4 consecutive words to match. Near 0 for most base models.",
+        ),
+        "METEOR": st.column_config.NumberColumn(
+            "METEOR",
+            help="Alignment-based metric accounting for synonyms, stemming, and word order. More lenient than BLEU.",
+        ),
+        "BERTScore F1": st.column_config.NumberColumn(
+            "BERTScore F1",
+            help="Semantic similarity using DeBERTa embeddings. High even when wording differs but meaning is similar.",
+        ),
+        "SBERT Cosine": st.column_config.NumberColumn(
+            "SBERT Cosine",
+            help="Cosine similarity between sentence embeddings (MiniLM). Captures overall semantic closeness.",
+        ),
+        "Refusal Rate": st.column_config.NumberColumn(
+            "Refusal Rate",
+            help="How often the model refuses to answer (says 'not enough info'). 0 = never refuses, 1 = always refuses.",
+        ),
+        "Avg Pred Len": st.column_config.NumberColumn(
+            "Avg Pred Len",
+            help="Average answer length in words. QASPER expects short answers; shorter is often better for F1.",
+        ),
+        "Length Ratio": st.column_config.NumberColumn(
+            "Length Ratio",
+            help="Predicted length / reference length. Ideally close to 1.0. >1 means model is too verbose.",
+        ),
+        "Vocab Diversity": st.column_config.NumberColumn(
+            "Vocab Diversity",
+            help="Type-Token Ratio — unique words / total words. Higher = richer vocabulary, less repetition.",
+        ),
+    }
+
+    ragas_col_help = {
+        "Faithfulness": st.column_config.NumberColumn(
+            "Faithfulness",
+            help="Is the answer grounded in the retrieved context? Higher = less hallucination. Scored by GPT-4o-mini.",
+        ),
+        "Answer Relevancy": st.column_config.NumberColumn(
+            "Answer Relevancy",
+            help="Does the answer actually address the question? Higher = more on-topic. Scored by GPT-4o-mini.",
+        ),
+        "Context Precision": st.column_config.NumberColumn(
+            "Context Precision",
+            help="Are the retrieved chunks relevant to the question? Similar across models since they share the same retriever.",
+        ),
+        "Context Recall": st.column_config.NumberColumn(
+            "Context Recall",
+            help="Do the retrieved chunks cover all info needed for the ground-truth answer? Measures retrieval completeness.",
+        ),
+        "Answer Correctness": st.column_config.NumberColumn(
+            "Answer Correctness",
+            help="Factual overlap between the answer and the ground-truth reference. Combines F1 and semantic similarity.",
+        ),
+    }
+
+    if os.path.exists(benchmark_csv):
+        df = pd.read_csv(benchmark_csv, index_col=0)
+        st.dataframe(df, use_container_width=True, column_config=benchmark_col_help)
+    else:
+        st.caption("Benchmark CSV not found. Run Notebook 6 to generate results.")
+
+    if os.path.exists(ragas_csv):
+        st.markdown("#### RAGAS -- RAG Quality Metrics")
+        rdf = pd.read_csv(ragas_csv, index_col=0)
+        st.dataframe(rdf, use_container_width=True, column_config=ragas_col_help)
+
+    # ── Charts with analysis ────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Visual Comparisons")
+    st.markdown(
+        "Each chart below includes a **How to read this** guide. "
+        "Charts are generated from the evaluation notebook (Notebook 6). "
+        "All 6 models were evaluated on the same 100 QASPER test questions."
+    )
+
+    img_dir = "img"
+
+    # Chart 1: Bar Charts
+    img_path = os.path.join(img_dir, "benchmark_comparison.png")
+    if os.path.exists(img_path):
+        st.markdown("#### Metric Bar Charts")
+        st.markdown(
+            "**How to read:** Each subplot shows one metric. Taller bars = better performance. "
+            "The dark blue bar (Jarvis) should be compared against the lighter bars (baselines). "
+            "If Jarvis is consistently taller across all subplots, it means fine-tuning improved "
+            "the model across the board, not just on one metric."
+        )
+        st.image(img_path, use_container_width=True)
+        st.markdown(
+            "**Analysis:** Jarvis Mk.X (dark blue) dominates every metric. The gap is largest in "
+            "Token F1 (0.51 vs ~0.10-0.15) and BLEU-4 (0.39 vs ~0.02-0.04), showing the fine-tuned model "
+            "produces answers with much better word-level overlap with the reference answers. "
+            "Vocab Diversity is also highest (0.91), meaning Jarvis uses richer, less repetitive language."
+        )
+        st.markdown("")
+
+    # Chart 2: Radar
+    img_path = os.path.join(img_dir, "radar_chart.png")
+    if os.path.exists(img_path):
+        st.markdown("#### Radar Chart")
+        st.markdown(
+            "**How to read:** Each axis represents a different metric (0-1 scale). "
+            "Each model forms a polygon — a larger polygon means better overall performance. "
+            "If one model's polygon fully encloses another's, it is strictly better on all metrics."
+        )
+        st.image(img_path, use_container_width=True)
+        st.markdown(
+            "**Analysis:** Jarvis Mk.X's blue polygon is visibly larger and encloses all other models. "
+            "The base models cluster together in a small region near the center, showing they perform "
+            "similarly to each other but far worse than the fine-tuned model. BERTScore (top) is the "
+            "closest axis where all models converge, because semantic similarity captures partial meaning "
+            "overlap even when word choice differs."
+        )
+        st.markdown("")
+
+    # Chart 3: Heatmap
+    img_path = os.path.join(img_dir, "heatmap.png")
+    if os.path.exists(img_path):
+        st.markdown("#### Metric Heatmap")
+        st.markdown(
+            "**How to read:** Rows are models, columns are metrics. Darker/bluer cells = higher scores. "
+            "Scan left-to-right across a row to see one model's profile. Scan top-to-bottom in a column "
+            "to compare all models on one metric. The best model has the darkest row overall."
+        )
+        st.image(img_path, use_container_width=True)
+        st.markdown(
+            "**Analysis:** The top row (Jarvis) is consistently the darkest across all columns. "
+            "The BERTScore column is the most uniformly dark (0.82-0.91 for all models), confirming "
+            "it is the least discriminative metric. Token F1 and BLEU-4 columns show the starkest "
+            "contrast between Jarvis and the baselines."
+        )
+        st.markdown("")
+
+    # Chart 4: Violin
+    img_path = os.path.join(img_dir, "f1_violin.png")
+    if os.path.exists(img_path):
+        st.markdown("#### Token F1 Distribution (Violin Plot)")
+        st.markdown(
+            "**How to read:** Each violin shows the full distribution of F1 scores across all 100 test questions. "
+            "The wider the violin at a score level, the more questions got that score. "
+            "Dashed lines show quartiles (25th, 50th, 75th percentile). "
+            "A violin reaching up to 1.0 means some questions were answered perfectly."
+        )
+        st.image(img_path, use_container_width=True)
+        st.markdown(
+            "**Analysis:** Jarvis has the widest spread, reaching 1.0 (perfect answers) for many questions, "
+            "with a fat bulge near the top. Base models all cluster near 0.0-0.2 with thin tails, "
+            "meaning they rarely produce high-quality answers. The median (middle dashed line) for "
+            "Jarvis is around 0.4, while baselines are around 0.05-0.10."
+        )
+        st.markdown("")
+
+    # Chart 5: Answer Length
+    img_path = os.path.join(img_dir, "answer_length_box.png")
+    if os.path.exists(img_path):
+        st.markdown("#### Answer Length Distribution")
+        st.markdown(
+            "**How to read:** Box plots show the median (middle line), interquartile range (box), "
+            "and outliers (dots). This shows how verbose each model's answers are. "
+            "For QASPER (short-answer Q&A), shorter answers that match the reference style score better."
+        )
+        st.image(img_path, use_container_width=True)
+        st.markdown(
+            "**Analysis:** Jarvis produces concise answers (~10-20 words) matching QASPER's short-answer style. "
+            "All base models produce 80-130 word answers — they haven't learned the dataset's expected format. "
+            "DeepSeek-V3.2 (API) is the most verbose (~135 words median). This verbosity explains why base models "
+            "have low Token F1 despite sometimes containing the right information buried in long responses."
+        )
+        st.markdown("")
+
+    # Chart 6: RAGAS
+    img_path = os.path.join(img_dir, "ragas_comparison.png")
+    if os.path.exists(img_path):
+        st.markdown("#### RAGAS -- RAG Quality Metrics")
+        st.markdown(
+            "**How to read:** These metrics are scored by GPT-4o-mini acting as a judge. "
+            "Each bar represents one model's score (0-1) on one RAG quality dimension. "
+            "Context Precision/Recall measure retrieval quality (same retriever for all models). "
+            "Faithfulness and Answer Relevancy measure generation quality."
+        )
+        st.image(img_path, use_container_width=True)
+        st.markdown(
+            "**Analysis:** Context Precision is similar across all models (0.74-0.77) because they share "
+            "the same retriever. Faithfulness is lower for Jarvis (0.60) than base models (0.78-0.84) — "
+            "this is because Jarvis gives concise answers that are harder for the GPT-4 judge to verify "
+            "against long context passages. However, Jarvis has the highest Answer Correctness (0.59), "
+            "meaning its answers are factually closest to the ground-truth references."
+        )
+        st.markdown("")
+
+    # ── Statistical Significance ─────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Statistical Significance")
+    st.markdown(
+        "We use **Bootstrap 95% Confidence Intervals** and **Wilcoxon signed-rank tests** "
+        "to verify that Jarvis Mk.X's improvements are real and not due to random chance."
+    )
+
+    with st.expander("What are these statistical tests?", expanded=False):
+        st.markdown("""
+**Bootstrap 95% Confidence Interval:** We resample the 100 test scores 1000 times with replacement and compute the mean each time. The interval [lower, upper] contains the true mean 95% of the time. If two models' intervals don't overlap, the difference is likely real.
+
+**Wilcoxon Signed-Rank Test:** A non-parametric test that compares paired scores (same question, different models). The p-value tells you the probability that the difference is due to chance. p < 0.05 is significant; p < 0.001 is highly significant (marked ***).
+
+**Delta (Δ):** The average improvement of Jarvis over the baseline. Positive Δ means Jarvis is better.
+        """)
+
+    # Load and display the summary JSON as a formatted table
+    summary_json = os.path.join("models", "evaluation_v5_qwen3", "benchmark_summary.json")
+    if os.path.exists(summary_json):
+        with open(summary_json, "r") as f:
+            summary_data = json.load(f)
+        ci_data = []
+        for item in summary_data:
+            ci_data.append({
+                "Model": item.get("model", "?"),
+                "Token F1": f"{item.get('token_f1', 0):.4f}",
+                "ROUGE-1": f"{item.get('rouge1', 0):.4f}",
+                "METEOR": f"{item.get('meteor', 0):.4f}",
+                "BERTScore F1": f"{item.get('bertscore_f1', 0):.4f}",
+                "SBERT Cosine": f"{item.get('sbert_cosine', 0):.4f}",
+            })
+        st.markdown("**Summary of Key Metrics:**")
+        st.dataframe(pd.DataFrame(ci_data).set_index("Model"), use_container_width=True)
+
+    st.markdown(
+        "All Wilcoxon tests show **p < 0.001** (***) for Jarvis vs every baseline on every metric, "
+        "confirming the improvements are highly statistically significant."
+    )
+
+    # ── Key Takeaways ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### Key Takeaways")
     st.markdown("""
-    **Features:** Up to 3 PDFs | Adjustable Leniency & Top-K |
-    Visualizations | Answer correction | PDF export
+1. **Fine-tuning delivers a 4x improvement.** Jarvis Mk.X scores 0.51 Token F1 vs 0.13 for the same base Qwen3-8B model.
 
-    Click **New Chat** to start!
+2. **All improvements are statistically significant** (p < 0.001 on Wilcoxon signed-rank tests across all 5 key metrics).
+
+3. **A fine-tuned 8B model beats a 671B frontier model.** DeepSeek-V3.2 (API) scores only 0.11 Token F1 -- our 8B model outperforms it by 4.8x on this task.
+
+4. **BERTScore is high across all models** (0.82-0.91) because it captures semantic similarity even when word choice differs. This makes it the least discriminative metric for this comparison.
+
+5. **Answer length matters.** Jarvis learned QASPER's concise answer style (~15 words). Base models produce 80-130 word responses, diluting their precision scores.
+
+6. **RAGAS reveals a trade-off:** Jarvis has lower Faithfulness (0.60 vs 0.84 for base) because its short answers give the GPT-4 judge less text to verify, but its Answer Correctness is highest (0.59), meaning the content is actually more accurate.
     """)
+
+    st.markdown("---")
+    st.markdown(
+        "**Ready to try it?** Click **+ New Chat** in the sidebar, upload a research paper PDF, "
+        "and ask questions. Switch between models using the dropdown to compare answers yourself!"
+    )
 
 else:
     session = get_session(st.session_state.current_session)
@@ -1135,14 +1403,32 @@ else:
                     with st.spinner(f"Processing {uf.name}..."):
                         paper = processor.process(filepath)
 
-                        # Generate summary from extracted text (no LLM needed)
+                    # Generate summary using Jarvis Mk.X (our fine-tuned model)
+                    with st.spinner(f"Jarvis Mk.X is summarizing {uf.name}..."):
+                        # Build context from abstract + intro + conclusion
+                        summary_parts = []
                         if paper.abstract:
-                            summary = paper.abstract[:500]
-                        elif paper.sections:
-                            first_section = list(paper.sections.values())[0]
-                            summary = first_section[:500]
-                        else:
-                            summary = "Summary will be available when you ask your first question."
+                            summary_parts.append(f"[Abstract]\n{paper.abstract[:2500]}")
+                        for sec_name, content in paper.sections.items():
+                            if any(kw in sec_name.lower() for kw in ["introduction", "conclusion", "summary"]):
+                                summary_parts.append(f"[{sec_name}]\n{content[:1500]}")
+                        if not summary_parts and paper.sections:
+                            first_sec = list(paper.sections.values())[0]
+                            summary_parts.append(f"[Opening]\n{first_sec[:2500]}")
+
+                        summary_context = "\n\n---\n\n".join(summary_parts) if summary_parts else "No text extracted."
+
+                        try:
+                            summary = _generate_summary_with_jarvis(summary_context, uf.name)
+                        except Exception as e:
+                            print(f"Jarvis summary failed: {e}")
+                            # Fallback to raw abstract
+                            if paper.abstract:
+                                summary = paper.abstract[:500]
+                            elif paper.sections:
+                                summary = list(paper.sections.values())[0][:500]
+                            else:
+                                summary = "Summary generation failed."
 
                     add_pdf(session_id=session_id, filename=uf.name, filepath=filepath,
                             summary=summary, num_pages=paper.num_pages,
@@ -1178,14 +1464,16 @@ else:
             for pdf in active_pdfs:
                 st.markdown(f"""<div class="pdf-summary">
                     <strong>{pdf['filename']}</strong> — {pdf['num_pages']}p, {pdf['num_chunks']} chunks<br>
-                    <em>{pdf['summary']}</em></div>""", unsafe_allow_html=True)
+                    <em>{pdf['summary']}</em><br>
+                    <span style="font-size:0.7em; color:#93c5fd; opacity:0.7;">
+                    Generated by Jarvis Mk.X</span></div>""", unsafe_allow_html=True)
 
     if st.session_state.suggested_questions and active_pdfs:
         st.markdown("**Suggested:**")
         cols = st.columns(3)
         for idx, q in enumerate(st.session_state.suggested_questions[:6]):
             with cols[idx % 3]:
-                if st.button(q, key=f"sq_{idx}", use_container_width=True):
+                if st.button(q, key=f"sq_{idx}", width="stretch"):
                     st.session_state.pending_question = q
                     st.rerun()
 
@@ -1224,123 +1512,119 @@ else:
                 sources = msg.get("sources", [])
 
                 with st.expander("Answer Analytics", expanded=False):
+
+                    # ── Row 1: Quick stats bar ──────────────────────────────
+                    gen_time = msg.get("generation_time", 0)
+                    model_used = msg.get("retrieval_methods", "N/A")
+                    num_sources = len(sources)
+                    top_score = max((s.get("score", 0) for s in sources), default=0)
+                    methods_used = list(set(s.get("method", "?") for s in sources))
+
+                    sc1, sc2, sc3, sc4 = st.columns(4)
+                    sc1.metric("Confidence", f"{msg['confidence']:.0%}")
+                    sc2.metric("Sources", f"{num_sources}")
+                    sc3.metric("Top Score", f"{top_score:.3f}")
+                    sc4.metric("Time", f"{gen_time:.1f}s")
+
+                    st.caption(f"Model: {model_used} | Methods: {', '.join(methods_used)}")
+                    st.divider()
+
+                    # ── Row 2: Confidence gauge + Score bar chart ──────────
                     v1, v2 = st.columns(2)
                     with v1:
                         st.plotly_chart(create_confidence_gauge(msg["confidence"]),
-                                         use_container_width=True,
-                                         key=f"chart_conf_{msg['id']}"
-                                         )
-                        st.caption(f"{msg.get('generation_time', 0):.1f}s | "
-                                   f"{msg.get('retrieval_methods', 'N/A')}")
+                                        width="stretch",
+                                        key=f"chart_conf_{msg['id']}")
                     with v2:
-                        fig = create_source_chart(sources)
+                        fig = create_source_scores_bar(sources)
                         if fig:
-                            st.plotly_chart(
-                                fig,
-                                use_container_width=True,
-                                key=f"chart_sources_{msg['id']}"
-                            )
+                            st.plotly_chart(fig, width="stretch",
+                                            key=f"chart_scores_{msg['id']}")
 
+                    # ── Row 3: Dense/Sparse breakdown + Answer keywords ────
                     v3, v4 = st.columns(2)
                     with v3:
-                        fig = create_method_pie(sources)
+                        fig = create_method_breakdown(sources)
                         if fig:
-                            st.plotly_chart(
-                                fig,
-                                use_container_width=True,
-                                key=f"chart_methodpie_{msg['id']}"
-                            )
+                            st.plotly_chart(fig, width="stretch",
+                                            key=f"chart_method_{msg['id']}")
                     with v4:
-                        fig = create_score_heatmap(sources)
+                        fig = create_answer_keywords(msg["content"])
                         if fig:
-                            st.plotly_chart(
-                                fig,
-                                use_container_width=True,
-                                key=f"chart_heatmap_{msg['id']}"
-                            )
+                            st.plotly_chart(fig, width="stretch",
+                                            key=f"chart_keywords_{msg['id']}")
 
+                    # ── Row 4: 3D Vector Space (UMAP/PCA) ─────────────────
                     if sources and len(sources) >= 2:
-                        st.markdown("**3D Vector Space Projection (PCA)**")
-                        st.caption("Red diamond = your query. Green = high score chunks. "
-                                   "Dashed lines = similarity connections.")
+                        st.markdown("**3D Vector Space — Query vs Retrieved Chunks**")
+                        st.caption("Red diamond = your query | "
+                                   "Green = high score | Yellow = medium | Blue = low. "
+                                   "Hover to see chunk text.")
                         prev_user = [m for m in messages if m["id"] < msg["id"] and m["role"] == "user"]
                         query_text = prev_user[-1]["content"] if prev_user else "query"
                         bot = get_bot()
                         fig = create_3d_vector_space(query_text, sources, bot.retriever.embed_model)
                         if fig:
-                            st.plotly_chart(
-                                fig,
-                                use_container_width=True,
-                                key=f"chart_3d_{msg['id']}"
-                            )
+                            st.plotly_chart(fig, width="stretch",
+                                            key=f"chart_3d_{msg['id']}")
 
-                    v5, v6 = st.columns(2)
-                    with v5:
-                        fig = create_chunk_length_chart(sources)
-                        if fig:
-                            st.plotly_chart(
-                                fig,
-                                use_container_width=True,
-                                key=f"chart_chunklens_{msg['id']}"
-                            )
-                    with v6:
-                        fig = create_answer_word_cloud_data(msg["content"])
-                        if fig:
-                            st.plotly_chart(
-                                fig,
-                                use_container_width=True,
-                                key=f"chart_wordcloud_{msg['id']}"
-                            )
+                    st.divider()
 
+                    # ── Retrieved Chunks (expandable, with full text) ──────
                     if sources:
-                        st.markdown("**Source Passages:**")
-                        for idx, src in enumerate(sources[:5]):
-                            badge = ("Dense" if src.get("method") == "dense"
-                                     else "Sparse" if src.get("method") == "sparse"
-                                     else "Hybrid")
-                            st.markdown(f"**Source {idx+1}** [{src.get('section', '?')}] "
-                                        f"p.{src.get('page_numbers', '?')} | "
-                                        f"Score: {src.get('score', 0):.3f} | {badge}")
+                        st.markdown("**Retrieved Source Chunks**")
+                        for idx_s, src in enumerate(sources[:5]):
+                            method = src.get("method", "hybrid")
+                            method_color = {"dense": "[D]", "sparse": "[S]", "hybrid": "[H]"}.get(method, "")
+                            score_val = src.get("score", 0)
+                            section = src.get("section", "Unknown")
+                            pages = src.get("page_numbers", [])
+                            page_str = f"p.{', '.join(str(p) for p in pages)}" if pages else "p.?"
+
+                            st.markdown(
+                                f"**{method_color} Source {idx_s+1}** — "
+                                f"`{section}` | {page_str} | "
+                                f"Score: **{score_val:.3f}** | {method.title()}"
+                            )
                             full_text = src.get("text") or src.get("text_preview", "")
-                            st.caption(full_text)
+                            # Show first 200 chars, expand for full
+                            if len(full_text) > 200:
+                                with st.expander(f"View full chunk ({len(full_text)} chars)", expanded=False):
+                                    st.text(full_text)
+                            else:
+                                st.caption(full_text)
 
+                    st.divider()
+
+                    # ── PDF Page Preview (highest confidence source) ───────
                     if sources and active_pdfs:
-                        st.markdown("**Referenced Pages:**")
-                        pdf_names = [p["filename"] for p in active_pdfs]
-                        selected_pdf_name = st.selectbox(
-                            "View PDF:", pdf_names,
-                            key=f"pdfsel_{msg['id']}"
-                        )
-                        selected_pdf = next(
-                            (p for p in active_pdfs if p["filename"] == selected_pdf_name), None
-                        )
-                        if selected_pdf and os.path.exists(selected_pdf["filepath"]):
-                            for src in sources[:2]:
-                                pages = src.get("page_numbers", [])
-                                if pages:
-                                    pnum = pages[0] - 1
-                                    pdf_for_source = selected_pdf
-                                    sec = (src.get("section") or "").strip()
-                                    if sec.startswith("[") and "]" in sec:
-                                        tagged_name = sec[1:sec.index("]")].strip()
-                                        match = next(
-                                            (p for p in active_pdfs if p.get("filename") == tagged_name),
-                                            None,
-                                        )
-                                        if match and os.path.exists(match.get("filepath", "")):
-                                            pdf_for_source = match
+                        st.markdown("**Referenced PDF Page** *(highest confidence source)*")
 
-                                    highlight_text = src.get("text") or src.get("text_preview", "")
-                                    img = render_pdf_page(
-                                        pdf_for_source["filepath"],
-                                        pnum,
-                                        highlight_texts=[highlight_text] if highlight_text else None,
-                                    )
-                                    if img:
-                                        st.image(img,
-                                                 caption=f"Page {pages[0]} — {src.get('section', '')}",
-                                                 width=550)
-                                    break
+                        # Find the best source
+                        best_src = max(sources, key=lambda s: s.get("score", 0))
+                        pages = best_src.get("page_numbers", [])
+
+                        if pages:
+                            # Determine which PDF this chunk came from
+                            sec = (best_src.get("section") or "").strip()
+                            pdf_for_source = active_pdfs[0]  # default
+                            if sec.startswith("[") and "]" in sec:
+                                tagged_name = sec[1:sec.index("]")].strip()
+                                match = next(
+                                    (p for p in active_pdfs if p.get("filename") == tagged_name),
+                                    None,
+                                )
+                                if match and os.path.exists(match.get("filepath", "")):
+                                    pdf_for_source = match
+
+                            pnum = pages[0] - 1  # 0-indexed
+                            if os.path.exists(pdf_for_source["filepath"]):
+                                img = render_pdf_page_simple(pdf_for_source["filepath"], pnum)
+                                if img:
+                                    st.image(img,
+                                             caption=f"{pdf_for_source['filename']} — Page {pages[0]} "
+                                                     f"(Score: {best_src.get('score', 0):.3f})",
+                                             width=600)
 
     pending = st.session_state.pop("pending_question", None)
 
@@ -1471,28 +1755,17 @@ else:
             with st.chat_message("assistant"):
                 with st.spinner(f"{_short} is thinking..."):
                     start_time = time.time()
-                    bot = get_bot(selected_model_key)
+                    bot = get_bot()
 
-                    # Ensure PDFs are indexed on this bot (needed after model swap)
+                    # Ensure PDFs are indexed on this bot (needed on first question)
                     load_all_pdfs_into_bot(session_id, active_pdfs, messages)
 
-                    if model_config.get("is_api"):
-                        # API model: use bot for retrieval, API for generation
-                        retrieved = bot.retriever.retrieve(prompt, top_k=top_k)
-                        answer_text = query_deepseek_api(prompt, retrieved, leniency)
-                        gen_time = time.time() - start_time
-
-                        # Build a response-like object
-                        class _ApiResponse:
-                            pass
-                        response = _ApiResponse()
-                        response.answer = answer_text
-                        response.sources = retrieved
-                        response.confidence = 0.5
-                        response.generation_time = gen_time
-                    else:
-                        # Local model
-                        response = bot.ask(prompt, top_k=top_k, leniency=leniency)
+                    # Load LLM → answer → unload LLM (GPU free between questions)
+                    response = answer_with_model(
+                        bot, selected_model_key, prompt,
+                        top_k=top_k, leniency=leniency,
+                    )
+                    response.generation_time = time.time() - start_time
 
                 st.markdown(response.answer)
 

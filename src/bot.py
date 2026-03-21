@@ -1,6 +1,6 @@
 """
-RAG Pipeline Module for Jarvis Mk.X (v4)
-Fixes: reasoning beyond literal text, application questions, conversational handling.
+RAG Pipeline Module for Jarvis Mk.X (v5 — Qwen3-8B)
+Supports Qwen3 (enable_thinking=False), Llama, Mistral, DeepSeek local models.
 """
 
 import torch
@@ -13,18 +13,24 @@ from dataclasses import dataclass, field
 import time
 
 
-# ─── System Prompt (v4 — allows reasoning and inference) ───
+# ─── System Prompt ───
 
 SYSTEM_PROMPT = (
-    "You are Jarvis Mk.X, a research paper Q&A assistant. "
-    "You answer questions based on the provided context from a research paper. "
-    "Always explain concepts in your own words rather than copying text directly. "
-    "Synthesize information from the context into clear, natural explanations. "
-    "When a user asks you to apply the paper's findings to a new situation, "
-    "use the paper's ideas and reasoning to provide a thoughtful answer, "
-    "clearly noting which parts come from the paper and which are your inference. "
-    "If the context truly contains no relevant information at all, say so honestly. "
-    "Reference which section or page the information comes from when relevant."
+    "You are Jarvis Mk.X, a research paper Q&A assistant.\n\n"
+    "STRICT RULES:\n"
+    "1. ONLY answer based on the provided context from the research paper.\n"
+    "2. If the context does not contain information to answer the question, "
+    "respond with: 'The provided context does not contain information to answer this question.'\n"
+    "3. NEVER make up facts, numbers, or claims not supported by the context.\n"
+    "4. Do NOT answer general knowledge questions — you only know what is in the paper.\n\n"
+    "RESPONSE FORMAT (always use this structure):\n"
+    "**Answer:** [Your direct answer based on the context]\n\n"
+    "**Reason:** [Explain your reasoning and how the context supports your answer]\n\n"
+    "**Sources:**\n"
+    "- [Section/page reference 1]\n"
+    "- [Section/page reference 2]\n\n"
+    "If the question asks you to apply the paper's findings to a new scenario, "
+    "clearly separate what comes from the paper vs your inference."
 )
 
 
@@ -48,12 +54,13 @@ class JarvisBot:
 
     def __init__(
         self,
-        base_model_name="mistralai/Mistral-7B-Instruct-v0.3",
-        adapter_path="models/jarvis-mkx-adapter-v2",
-        embed_model_name="sentence-transformers/allenai-specter",
+        base_model_name="Qwen/Qwen3-8B",
+        adapter_path="models/jarvis-mkx-qwen3-8b-adapter",
+        embed_model_name="voyage-4-large",
         chunk_size=512,
         chunk_overlap=50,
         load_in_4bit=True,
+        is_qwen3=None,
     ):
         self.base_model_name = base_model_name
         self.adapter_path = adapter_path
@@ -67,11 +74,25 @@ class JarvisBot:
         self.max_history_turns = 6
         self.corrections = []
 
+        # Auto-detect Qwen3 models (need enable_thinking=False)
+        if is_qwen3 is not None:
+            self.is_qwen3 = is_qwen3
+        else:
+            self.is_qwen3 = "qwen3" in (base_model_name or "").lower()
+
     def load_model(self):
         if self.model is not None:
             print("Model already loaded.")
             return
         print(f"Loading base model: {self.base_model_name}")
+
+        # Clear GPU memory before loading (important when swapping models)
+        import gc
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.base_model_name, trust_remote_code=True,
@@ -85,28 +106,26 @@ class JarvisBot:
             "torch_dtype": torch.bfloat16,
             "trust_remote_code": True,
             "low_cpu_mem_usage": True,
-            "max_memory": {0: "23GiB", "cpu": "10GiB"},
         }
 
-        # bitsandbytes 4-bit quantization crashes silently on Windows (C++ segfault).
-        # On Windows: always use bfloat16 (works fine on 24GB GPUs).
-        # On Linux:   use 4-bit if requested (saves ~10GB VRAM).
-        import platform
-        use_4bit = self.load_in_4bit and platform.system() != "Windows"
-
-        if use_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True, bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
-            )
-            bnb_kwargs = {**model_kwargs, "quantization_config": bnb_config}
-            bnb_kwargs.pop("max_memory", None)
-            base_model = AutoModelForCausalLM.from_pretrained(self.base_model_name, **bnb_kwargs)
-            print("Loaded with 4-bit quantization")
+        # Try 4-bit first (works on Windows with bitsandbytes>=0.42)
+        # Falls back to bfloat16 if quantization fails
+        if self.load_in_4bit:
+            try:
+                bnb_config = BitsAndBytesConfig(
+                    load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                    bnb_4bit_compute_dtype=torch.bfloat16, bnb_4bit_use_double_quant=True,
+                )
+                bnb_kwargs = {**model_kwargs, "quantization_config": bnb_config}
+                base_model = AutoModelForCausalLM.from_pretrained(self.base_model_name, **bnb_kwargs)
+                print("Loaded with 4-bit quantization")
+            except Exception as e:
+                print(f"4-bit failed ({e}), falling back to bfloat16")
+                gc.collect()
+                torch.cuda.empty_cache()
+                base_model = AutoModelForCausalLM.from_pretrained(self.base_model_name, **model_kwargs)
+                print("Loaded in bfloat16")
         else:
-            if platform.system() == "Windows" and self.load_in_4bit:
-                print("Skipping 4-bit quantization (bitsandbytes unstable on Windows)")
-                print("  Using bfloat16 instead — fits on 24GB GPUs")
             base_model = AutoModelForCausalLM.from_pretrained(self.base_model_name, **model_kwargs)
             print("Loaded in bfloat16")
 
@@ -116,14 +135,30 @@ class JarvisBot:
                 print(f"Loading LoRA adapter: {self.adapter_path}")
                 self.model = PeftModel.from_pretrained(base_model, self.adapter_path)
             else:
-                print(f"Adapter path not found: {self.adapter_path} — using base model")
+                print(f"Adapter not found: {self.adapter_path} — using base model")
                 self.model = base_model
         else:
             print("No adapter — using base model directly")
             self.model = base_model
 
         self.model.eval()
-        print("Model loaded and ready.")
+        print(f"✓ Model ready ({self.base_model_name})")
+
+    def unload_model(self):
+        """Free GPU memory by unloading the LLM (keeps retriever alive)."""
+        if self.model is not None:
+            del self.model
+            self.model = None
+        if self.tokenizer is not None:
+            del self.tokenizer
+            self.tokenizer = None
+        import gc
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        print("Model unloaded, GPU freed")
 
     def load_paper(self, pdf_path):
         print(f"Processing PDF: {pdf_path}")
@@ -142,19 +177,13 @@ class JarvisBot:
             "sections": list(self.current_paper.sections.keys()),
         }
         print(f"Paper loaded: {paper_info['title']}")
-        print(f"  {paper_info['num_sections']} sections, {paper_info['num_chunks']} chunks")
         return paper_info
 
     # ─── Question Classification ───
 
     def _classify_question(self, question):
-        """
-        Classify the question type to determine handling strategy.
-        Returns: 'meta', 'application', 'conversational', or 'factual'
-        """
         q_lower = question.lower().strip()
 
-        # Meta questions (summarize, overview, etc.)
         meta_patterns = [
             "summarize", "summary", "what is this paper about",
             "what is the paper about", "overview", "main topic",
@@ -171,10 +200,9 @@ class JarvisBot:
             "what are the key", "what is the conclusion",
             "do you think this paper", "what do you think",
         ]
-        if any(pattern in q_lower for pattern in meta_patterns):
+        if any(p in q_lower for p in meta_patterns):
             return "meta"
 
-        # Application questions (apply paper's ideas to new scenario)
         application_patterns = [
             "what would the paper suggest", "what would the author suggest",
             "what solutions", "how could", "how would",
@@ -186,17 +214,16 @@ class JarvisBot:
             "how does this apply", "what are the solutions",
             "what advice", "suggest", "recommend",
         ]
-        if any(pattern in q_lower for pattern in application_patterns):
+        if any(p in q_lower for p in application_patterns):
             return "application"
 
-        # Conversational (greetings, insults, off-topic chitchat)
         conversational_patterns = [
             "hello", "hi ", "hey", "how are you", "thank",
             "you are not", "you're not", "you suck", "stupid",
             "who are you", "what are you", "goodbye", "bye",
             "good morning", "good evening",
         ]
-        if any(pattern in q_lower for pattern in conversational_patterns):
+        if any(p in q_lower for p in conversational_patterns):
             return "conversational"
 
         return "factual"
@@ -204,7 +231,6 @@ class JarvisBot:
     # ─── Context Builders ───
 
     def _get_meta_context(self):
-        """Build context from abstract + introduction + conclusion."""
         parts = []
         for section_name, content in self.current_paper.sections.items():
             name_lower = section_name.lower()
@@ -223,14 +249,7 @@ class JarvisBot:
         return "\n\n---\n\n".join(fallback)
 
     def _get_broad_context(self, question, max_tokens=2000):
-        """
-        For application questions, cast a wider net:
-        retrieve more chunks AND include conclusion/recommendations.
-        """
-        # Get retrieval results with relaxed threshold
         sources = self.retriever.retrieve(question, top_k=8)
-
-        # Always include conclusion/recommendation sections
         priority_sections = []
         for section_name, content in self.current_paper.sections.items():
             name_lower = section_name.lower()
@@ -241,7 +260,6 @@ class JarvisBot:
                 text = content[:1500] if len(content) > 1500 else content
                 priority_sections.append(f"[Section: {section_name}]\n{text}")
 
-        # Also include top retrieval results
         retrieval_parts = []
         total_tokens = 0
         for result in sources[:5]:
@@ -252,10 +270,7 @@ class JarvisBot:
             retrieval_parts.append(f"{source_info}\n{result.text}")
             total_tokens += approx_tokens
 
-        # Combine: priority sections first, then retrieval results
         all_parts = priority_sections + retrieval_parts
-
-        # Deduplicate (rough check)
         seen = set()
         unique_parts = []
         for part in all_parts:
@@ -269,42 +284,57 @@ class JarvisBot:
     # ─── Core Generation ───
 
     def _generate_answer(self, question, context, corrections_text="",
-                         max_new_tokens=512, temperature=0.3):
+                         max_new_tokens=700, temperature=0.3):
         messages = self._build_messages(question, context, corrections_text)
-        inputs = self.tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True, return_tensors="pt",
-            return_dict=False,
-        )
-        # Ensure inputs is a tensor, not a BatchEncoding
-        if not isinstance(inputs, torch.Tensor):
-            inputs = inputs["input_ids"]
-        inputs = inputs.to(self.model.device)
 
-        if inputs.shape[-1] > 2048 - max_new_tokens:
+        # ─── Tokenize with proper handling for Qwen3 vs other models ───
+        template_kwargs = dict(
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,   # Always request dict for safety
+        )
+        if self.is_qwen3:
+            template_kwargs["enable_thinking"] = False
+
+        encoded = self.tokenizer.apply_chat_template(messages, **template_kwargs)
+
+        # Handle both tensor and BatchEncoding returns
+        if isinstance(encoded, dict) or hasattr(encoded, "input_ids"):
+            input_ids = encoded["input_ids"].to(self.model.device)
+            attention_mask = encoded["attention_mask"].to(self.model.device)
+        else:
+            input_ids = encoded.to(self.model.device)
+            attention_mask = torch.ones_like(input_ids)
+
+        # Truncate if too long
+        if input_ids.shape[-1] > 2048 - max_new_tokens:
             self.conversation_history = self.conversation_history[-2:]
             messages = self._build_messages(question, context, corrections_text)
-            inputs = self.tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True, return_tensors="pt",
-                return_dict=False,
-            )
-            if not isinstance(inputs, torch.Tensor):
-                inputs = inputs["input_ids"]
-            inputs = inputs.to(self.model.device)
+            encoded = self.tokenizer.apply_chat_template(messages, **template_kwargs)
+            if isinstance(encoded, dict) or hasattr(encoded, "input_ids"):
+                input_ids = encoded["input_ids"].to(self.model.device)
+                attention_mask = encoded["attention_mask"].to(self.model.device)
+            else:
+                input_ids = encoded.to(self.model.device)
+                attention_mask = torch.ones_like(input_ids)
 
         with torch.no_grad():
             outputs = self.model.generate(
-                inputs, max_new_tokens=max_new_tokens,
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
                 temperature=max(temperature, 0.01),
                 top_p=0.9, do_sample=True, repetition_penalty=1.1,
             )
         return self.tokenizer.decode(
-            outputs[0][inputs.shape[-1]:], skip_special_tokens=True
+            outputs[0][input_ids.shape[-1]:], skip_special_tokens=True
         ).strip()
 
     # ─── Main Ask Method ───
 
     def ask(self, question, top_k=5, max_context_tokens=1500,
-            max_new_tokens=512, leniency=50):
+            max_new_tokens=700, leniency=50):
         if self.model is None:
             self.load_model()
         if self.current_paper is None:
@@ -315,7 +345,6 @@ class JarvisBot:
 
         start_time = time.time()
 
-        # Build corrections text
         corrections_text = ""
         if self.corrections:
             relevant = self._find_relevant_corrections(question)
@@ -328,10 +357,9 @@ class JarvisBot:
                     )
                 )
 
-        # ─── Classify the question ───
         q_type = self._classify_question(question)
 
-        # ─── CONVERSATIONAL: handle greetings, off-topic ───
+        # ─── CONVERSATIONAL ───
         if q_type == "conversational":
             q_lower = question.lower()
             if any(w in q_lower for w in ["hello", "hi ", "hey", "good morning", "good evening"]):
@@ -363,7 +391,7 @@ class JarvisBot:
                 confidence=1.0, generation_time=time.time() - start_time,
             )
 
-        # ─── META: summary, overview, key takeaways ───
+        # ─── META ───
         if q_type == "meta":
             context = self._get_meta_context()
             sources = self.retriever.retrieve(question, top_k=3)
@@ -378,11 +406,9 @@ class JarvisBot:
                 confidence=1.0, generation_time=time.time() - start_time,
             )
 
-        # ─── APPLICATION: apply paper's ideas to new scenario ───
+        # ─── APPLICATION ───
         if q_type == "application":
             context, sources = self._get_broad_context(question)
-
-            # Add a reasoning instruction to the context
             reasoning_note = (
                 "\n\n### Note: The user is asking you to apply the paper's findings "
                 "to a specific scenario. Use the paper's ideas, recommendations, and "
@@ -390,36 +416,30 @@ class JarvisBot:
                 "come from the paper and which are your reasoning."
             )
             context = context + reasoning_note
-
             answer = self._generate_answer(
                 question, context, corrections_text,
                 max_new_tokens=max_new_tokens, temperature=0.35,
             )
             self._add_to_history(question, answer)
-
             filtered = [s for s in sources if s.score >= 0.1]
             avg_conf = sum(s.score for s in filtered) / len(filtered) if filtered else 0.0
-
             return BotResponse(
                 answer=answer, sources=sources, context_used=context,
                 paper_title=self.current_paper.title,
                 confidence=avg_conf, generation_time=time.time() - start_time,
             )
 
-        # ─── FACTUAL: standard retrieval-based Q&A ───
+        # ─── FACTUAL ───
         score_threshold = 0.5 - (leniency / 100) * 0.45
         temperature = 0.1 + (leniency / 100) * 0.4
 
         sources = self.retriever.retrieve(question, top_k=top_k)
         filtered_sources = [s for s in sources if s.score >= score_threshold]
-
         avg_confidence = (
             sum(s.score for s in filtered_sources) / len(filtered_sources)
             if filtered_sources else 0.0
         )
 
-        # If retrieval confidence is low, still attempt an answer using the best available context.
-        # This prevents the UI from feeling "broken" for harder questions or weaker embedding models.
         if not filtered_sources:
             if not sources:
                 return BotResponse(
@@ -427,16 +447,13 @@ class JarvisBot:
                         "I couldn't retrieve any relevant passages to answer this question. "
                         "Try rephrasing, uploading a clearer PDF, or asking a more specific question."
                     ),
-                    sources=[],
-                    context_used="",
+                    sources=[], context_used="",
                     paper_title=self.current_paper.title,
-                    confidence=0.0,
-                    generation_time=time.time() - start_time,
+                    confidence=0.0, generation_time=time.time() - start_time,
                 )
 
             best_score = float(sources[0].score)
-            fallback_sources = sources[: min(3, len(sources))]
-
+            fallback_sources = sources[:min(3, len(sources))]
             context_parts = []
             total_tokens = 0
             for result in fallback_sources:
@@ -447,32 +464,21 @@ class JarvisBot:
                 context_parts.append(f"{source_info}\n{result.text}")
                 total_tokens += approx_tokens
             context = "\n\n---\n\n".join(context_parts)
-
             answer = self._generate_answer(
-                question,
-                context,
-                corrections_text,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
+                question, context, corrections_text,
+                max_new_tokens=max_new_tokens, temperature=temperature,
             )
-
             answer = (
                 "Low retrieval confidence: I may be missing supporting passages in the PDF. "
                 "Answering using the closest matches I found.\n\n" + answer
             )
-
             self._add_to_history(question, answer)
-
             return BotResponse(
-                answer=answer,
-                sources=fallback_sources,
-                context_used=context,
+                answer=answer, sources=fallback_sources, context_used=context,
                 paper_title=self.current_paper.title,
-                confidence=best_score,
-                generation_time=time.time() - start_time,
+                confidence=best_score, generation_time=time.time() - start_time,
             )
 
-        # Build context
         context_parts = []
         total_tokens = 0
         for result in filtered_sources:
@@ -483,14 +489,11 @@ class JarvisBot:
             context_parts.append(f"{source_info}\n{result.text}")
             total_tokens += approx_tokens
         context = "\n\n---\n\n".join(context_parts)
-
         answer = self._generate_answer(
             question, context, corrections_text,
             max_new_tokens=max_new_tokens, temperature=temperature,
         )
-
         self._add_to_history(question, answer)
-
         return BotResponse(
             answer=answer, sources=filtered_sources, context_used=context,
             paper_title=self.current_paper.title,
@@ -500,19 +503,8 @@ class JarvisBot:
     # ─── Conversation Memory ───
 
     def _build_messages(self, question, context, corrections_text=""):
-        """Build a chat transcript for the model.
-
-        Important: the retrieved context must always be paired with the *current*
-        user question. Previously, the first question of the session was embedded
-        into the initial prompt and then replayed every turn, which could
-        incorrectly bias subsequent answers.
-        """
-
         messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-        # Keep limited conversation continuity, but avoid feeding back responses
-        # that are explicitly retrieval failures (they can prime the model to
-        # keep refusing even when later retrieval succeeds).
         history_msgs = []
         if self.conversation_history:
             for turn in self.conversation_history:
@@ -525,17 +517,13 @@ class JarvisBot:
                         continue
                 history_msgs.append({"role": turn.role, "content": turn.content})
 
-        # Enforce strict user/assistant alternation (Mistral requires this).
-        # Drop any message that would create consecutive same-role entries.
+        # Enforce strict user/assistant alternation
         cleaned = []
         for m in history_msgs:
             if cleaned and cleaned[-1]["role"] == m["role"]:
-                # Same role twice in a row — skip the earlier one
                 cleaned[-1] = m
             else:
                 cleaned.append(m)
-
-        # The next message we append is "user", so history must not end with "user"
         if cleaned and cleaned[-1]["role"] == "user":
             cleaned.pop()
 
@@ -544,7 +532,10 @@ class JarvisBot:
         user_content = (
             f"### Context from Research Paper:\n{context}"
             f"{corrections_text}\n\n"
-            f"### Question:\n{question}"
+            f"### Question:\n{question}\n\n"
+            f"Remember: respond using the format **Answer:**, **Reason:**, **Sources:** (bullet points). "
+            f"Be detailed in your answer and reasoning. "
+            f"If the context does not contain the answer, say so."
         )
         messages.append({"role": "user", "content": user_content})
         return messages
@@ -557,7 +548,6 @@ class JarvisBot:
 
     def clear_history(self):
         self.conversation_history = []
-        print("Conversation history cleared.")
 
     def get_history(self):
         return [{"role": t.role, "content": t.content} for t in self.conversation_history]
