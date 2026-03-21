@@ -395,7 +395,11 @@ MODEL_CONFIGS = {
         "description": "Mistral 7B Instruct via OpenRouter API — no GPU needed",
         "is_api": True,
         "api_provider": "openrouter",
+<<<<<<< HEAD
         "api_model": "mistralai/mistral-7b-instruct",
+=======
+        "api_model": "mistralai/mistral-7b-instruct-v0.1",
+>>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
         "min_vram": 0,
     },
     "deepseek_v3_api": {
@@ -972,7 +976,11 @@ with st.sidebar:
                             st.rerun()
                 with c2:
                     with st.container(key=f"session_delete_{sess['id']}"):
+<<<<<<< HEAD
                         if st.button("X", key=f"d_{sess['id']}", width="stretch"):
+=======
+                        if st.button("🗑️", key=f"d_{sess['id']}", width="stretch"):
+>>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
                             delete_session(sess["id"])
                             if st.session_state.current_session == sess["id"]:
                                 st.session_state.current_session = None
@@ -1533,26 +1541,58 @@ else:
                     v1, v2 = st.columns(2)
                     with v1:
                         st.plotly_chart(create_confidence_gauge(msg["confidence"]),
+<<<<<<< HEAD
                                         width="stretch",
                                         key=f"chart_conf_{msg['id']}")
+=======
+                                         width="stretch",
+                                         key=f"chart_conf_{msg['id']}"
+                                         )
+                        st.caption(f"{msg.get('generation_time', 0):.1f}s | "
+                                   f"{msg.get('retrieval_methods', 'N/A')}")
+>>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
                     with v2:
                         fig = create_source_scores_bar(sources)
                         if fig:
+<<<<<<< HEAD
                             st.plotly_chart(fig, width="stretch",
                                             key=f"chart_scores_{msg['id']}")
+=======
+                            st.plotly_chart(
+                                fig,
+                                width="stretch",
+                                key=f"chart_sources_{msg['id']}"
+                            )
+>>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
 
                     # ── Row 3: Dense/Sparse breakdown + Answer keywords ────
                     v3, v4 = st.columns(2)
                     with v3:
                         fig = create_method_breakdown(sources)
                         if fig:
+<<<<<<< HEAD
                             st.plotly_chart(fig, width="stretch",
                                             key=f"chart_method_{msg['id']}")
+=======
+                            st.plotly_chart(
+                                fig,
+                                width="stretch",
+                                key=f"chart_methodpie_{msg['id']}"
+                            )
+>>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
                     with v4:
                         fig = create_answer_keywords(msg["content"])
                         if fig:
+<<<<<<< HEAD
                             st.plotly_chart(fig, width="stretch",
                                             key=f"chart_keywords_{msg['id']}")
+=======
+                            st.plotly_chart(
+                                fig,
+                                width="stretch",
+                                key=f"chart_heatmap_{msg['id']}"
+                            )
+>>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
 
                     # ── Row 4: 3D Vector Space (UMAP/PCA) ─────────────────
                     if sources and len(sources) >= 2:
@@ -1565,10 +1605,36 @@ else:
                         bot = get_bot()
                         fig = create_3d_vector_space(query_text, sources, bot.retriever.embed_model)
                         if fig:
+<<<<<<< HEAD
                             st.plotly_chart(fig, width="stretch",
                                             key=f"chart_3d_{msg['id']}")
 
                     st.divider()
+=======
+                            st.plotly_chart(
+                                fig,
+                                width="stretch",
+                                key=f"chart_3d_{msg['id']}"
+                            )
+
+                    v5, v6 = st.columns(2)
+                    with v5:
+                        fig = create_chunk_length_chart(sources)
+                        if fig:
+                            st.plotly_chart(
+                                fig,
+                                width="stretch",
+                                key=f"chart_chunklens_{msg['id']}"
+                            )
+                    with v6:
+                        fig = create_answer_word_cloud_data(msg["content"])
+                        if fig:
+                            st.plotly_chart(
+                                fig,
+                                width="stretch",
+                                key=f"chart_wordcloud_{msg['id']}"
+                            )
+>>>>>>> e309c453e7fc26127ccecc41d78be57c6928b4d0
 
                     # ── Retrieved Chunks (expandable, with full text) ──────
                     if sources:
