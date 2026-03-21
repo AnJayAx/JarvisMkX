@@ -1,0 +1,7 @@
+Model,Faithfulness,Answer Relevancy,Context Precision,Context Recall,Answer Correctness
+Qwen3-8B Finetuned (Jarvis),0.5986,0.3011,0.7600,0.6352,0.5945
+Qwen3-8B (Base),0.8425,0.4983,0.7400,0.6652,0.3578
+DeepSeek-R1-7B (Base),0.7088,0.0544,0.7500,0.6352,0.2960
+Llama-3.1-8B (Base),0.7764,0.4126,0.7600,0.6402,0.3612
+Mistral-7B (Base),0.7823,0.4959,0.7500,0.6452,0.3388
+DeepSeek-V3.2 (API),0.8388,0.5075,0.7700,0.6452,0.3260
