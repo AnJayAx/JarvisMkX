@@ -34,7 +34,7 @@ A Retrieval-Augmented Generation (RAG) system for research paper Q&A, powered by
 Jarvis Mk.X is a research paper Q&A chatbot that lets users upload PDF research papers and ask questions about their content. The system uses:
 
 1. **PDF Processing** -- Extracts text from PDFs, detects section headers via font-size heuristics, and chunks text into ~512-token segments with metadata.
-2. **Hybrid Retrieval** -- Combines dense semantic search (Voyage 3 Large + ChromaDB) with sparse keyword matching (BM25).
+2. **Hybrid Retrieval** -- Combines dense semantic search (Voyage 4 Large + ChromaDB) with sparse keyword matching (BM25).
 3. **Cross-Encoder Reranking** -- Uses BGE Reranker v2 M3 to re-score candidates, improving Precision@5 by 41%.
 4. **Fine-Tuned LLM** -- Qwen3-8B fine-tuned with QLoRA on QASPER + PubMedQA, achieving 4x better Token F1 than base.
 5. **Multi-Model Comparison** -- Users can switch between 6 models (2 local + 4 API) to compare answers.
@@ -53,8 +53,8 @@ Jarvis Mk.X is a research paper Q&A chatbot that lets users upload PDF research 
     |  - Chat sessions  |  - PDF upload (up to 3)                           |
     |  - Search         |  - Model selector (6 models)                      |
     |  - New Chat       |  - Leniency / Top-K controls                      |
-    |                   |  - Answer with Answer/Reason/Sources format        |
-    |                   |  - Answer Analytics (charts, 3D vector space, PDF) |
+    |                   |  - Answer with Answer/Reason/Sources format       |
+    |                   |  - Answer Analytics (charts, 3D vector space, PDF)|
     +-----------------------------------------------------------------------+
                                         |
                                         v
@@ -67,17 +67,18 @@ Jarvis Mk.X is a research paper Q&A chatbot that lets users upload PDF research 
     +-----------------------------------------------------------------------+
                         |                       |
               +---------+---------+    +--------+--------+
+              |                   |    |                 |  
               v                   v    v                 v
     LOCAL MODELS              API MODELS            RETRIEVAL PIPELINE
     +------------------+   +------------------+   +----------------------+
-    | Jarvis Mk.X      |   | Qwen3-8B Base   |   | 1. PDF Processing    |
-    | (Qwen3-8B+QLoRA) |   |   (OpenRouter)  |   |    (PyMuPDF)         |
-    |                  |   | Llama-3.1-8B    |   |                      |
-    | DeepSeek-R1-7B   |   |   (OpenRouter)  |   | 2. Embedding         |
-    | (local, no API)  |   | Mistral-7B      |   |    (Voyage 3 Large)  |
-    +------------------+   |   (OpenRouter)  |   |                      |
-                           | DeepSeek-V3.2   |   | 3. Hybrid Retrieval  |
-                           |   (DeepSeek API)|   |    Dense + BM25      |
+    | Jarvis Mk.X      |   | Qwen3-8B Base    |   | 1. PDF Processing    |
+    | (Qwen3-8B+QLoRA) |   |   (OpenRouter)   |   |    (PyMuPDF)         |
+    |                  |   | Llama-3.1-8B     |   |                      |
+    | DeepSeek-R1-7B   |   |   (OpenRouter)   |   | 2. Embedding         |
+    | (local, no API)  |   | Mistral-7B       |   |    (Voyage 4 Large)  |
+    +------------------+   |   (OpenRouter)   |   |                      |
+                           | DeepSeek-V3.2    |   | 3. Hybrid Retrieval  |
+                           |   (DeepSeek API) |   |    Dense + BM25      |
                            +------------------+   |                      |
                                                   | 4. BGE Reranking     |
                                                   |    (CrossEncoder)    |
@@ -96,7 +97,7 @@ User Question
     |                  --> factual?        --> Standard retrieval
     v
 [Hybrid Retrieval]
-    |-- Dense: Voyage 3 Large embeddings -> ChromaDB cosine (top 15)
+    |-- Dense: Voyage 4 Large embeddings -> ChromaDB cosine (top 15)
     |-- Sparse: BM25 keyword matching (top 15)
     |-- Fusion: 0.6 * dense + 0.4 * sparse
     v
@@ -140,7 +141,7 @@ User Question
 | LLM (Fine-tuned) | Qwen3-8B + QLoRA | Research paper Q&A generation |
 | LLM (Base models) | Qwen3-8B, DeepSeek-R1-7B | Local baseline comparison |
 | LLM (API models) | Llama-3.1-8B, Mistral-7B, DeepSeek-V3.2 | API baseline via OpenRouter |
-| Embeddings | Voyage 3 Large (API, 1024-dim) | Dense semantic retrieval |
+| Embeddings | Voyage 4 Large (API, 1024-dim) | Dense semantic retrieval |
 | Vector Store | ChromaDB (in-memory, cosine) | Dense retrieval index |
 | Sparse Index | BM25Okapi (rank-bm25) | Keyword-based retrieval |
 | Reranker | BGE Reranker v2 M3 (CrossEncoder) | Cross-encoder reranking |
@@ -347,13 +348,13 @@ QASPER has very short answers (often just a phrase or sentence), while PubMedQA 
 ### Components
 
 ```
-Query -> [Dense: Voyage 3 Large + ChromaDB] --+
+Query -> [Dense: Voyage 4 Large + ChromaDB] --+
          [Sparse: BM25Okapi]                 --+--> Hybrid Fusion --> BGE Rerank --> Top 5
 ```
 
 | Component | Technology | Role |
 |---|---|---|
-| Dense embeddings | Voyage 3 Large (API, 1024-dim) | Captures semantic meaning -- "How does the model work?" matches architecture chunks |
+| Dense embeddings | Voyage 4 Large (API, 1024-dim) | Captures semantic meaning -- "How does the model work?" matches architecture chunks |
 | Vector store | ChromaDB (in-memory, cosine similarity) | Fast approximate nearest neighbor search |
 | Sparse index | BM25Okapi | Captures exact keywords -- "BLEU 28.4" matches chunks with those exact terms |
 | Fusion | 0.6 * dense + 0.4 * sparse | Combines semantic understanding with keyword precision |
@@ -373,7 +374,7 @@ We evaluated 6 retrieval strategies and 3 reranker configurations in Notebook 4 
 
 | Strategy | How It Works |
 |---|---|
-| **Dense** | Voyage 3 Large embeddings -> ChromaDB cosine similarity |
+| **Dense** | Voyage 4 Large embeddings -> ChromaDB cosine similarity |
 | **Sparse (BM25)** | Tokenize query -> BM25Okapi scoring against all chunks |
 | **Hybrid** | 0.6 * dense_score + 0.4 * sparse_score fusion |
 | **Metadata-filtered** | Dense search with 1.3x boost for chunks in relevant sections |
@@ -621,7 +622,7 @@ Create a `.env` file in the project root:
 ```env
 OPENROUTER_API_KEY=sk-or-v1-...    # Qwen3, Llama, Mistral API models
 DEEPSEEK_API_KEY=sk-...             # DeepSeek-V3.2 API model
-VOYAGE_API_KEY=pa-...               # Voyage 3 Large embeddings
+VOYAGE_API_KEY=pa-...               # Voyage 4 Large embeddings
 ```
 
 | Service | Free tier? | URL |
