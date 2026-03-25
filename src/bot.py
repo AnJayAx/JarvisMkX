@@ -304,7 +304,7 @@ class JarvisBot:
     # ─── Core Generation ───
 
     def _generate_answer(self, question, context, corrections_text="",
-                         max_new_tokens=700, temperature=0.3):
+                         max_new_tokens=1024, temperature=0.3):
         messages = self._build_messages(question, context, corrections_text)
 
         # ─── Tokenize with proper handling for Qwen3 vs other models ───
@@ -328,7 +328,7 @@ class JarvisBot:
             attention_mask = torch.ones_like(input_ids)
 
         # Truncate if too long
-        if input_ids.shape[-1] > 2048 - max_new_tokens:
+        if input_ids.shape[-1] > 4096 - max_new_tokens:
             self.conversation_history = self.conversation_history[-2:]
             messages = self._build_messages(question, context, corrections_text)
             encoded = self.tokenizer.apply_chat_template(messages, **template_kwargs)
@@ -354,7 +354,7 @@ class JarvisBot:
     # ─── Main Ask Method ───
 
     def ask(self, question, top_k=5, max_context_tokens=1500,
-            max_new_tokens=700, leniency=50):
+            max_new_tokens=1024, leniency=50):
         if self.model is None:
             self.load_model()
         if self.current_paper is None:
@@ -560,9 +560,14 @@ class JarvisBot:
             f"### Context from Research Paper:\n{context}"
             f"{corrections_text}\n\n"
             f"### Question:\n{question}\n\n"
-            f"Remember: respond using the format **Answer:**, **Reason:**, **Sources:** (bullet points). "
-            f"Be detailed in your answer and reasoning. "
-            f"If the context does not contain the answer, say so."
+            f"### IMPORTANT -- You MUST respond in this exact format:\n\n"
+            f"**Answer:** [Write a detailed, thorough answer in 2-4 sentences using information from the context above]\n\n"
+            f"**Reason:** [Explain in 2-3 sentences why this answer is correct, referencing specific parts of the context]\n\n"
+            f"**Sources:**\n"
+            f"- [Source 1] Section name, page number -- brief quote or description\n"
+            f"- [Source 2] Section name, page number -- brief quote or description\n\n"
+            f"Do NOT give a one-line answer. Write at least 3 sentences for **Answer:** and 2 sentences for **Reason:**. "
+            f"If the context does not contain the answer, say so in the **Answer:** section."
         )
         messages.append({"role": "user", "content": user_content})
         return messages

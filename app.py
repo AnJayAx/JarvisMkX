@@ -604,8 +604,13 @@ def query_api(prompt, context_chunks, leniency=50, provider="deepseek", model="d
         "content": (
             f"### Context from Research Paper:\n{context_text}\n\n"
             f"### Question:\n{prompt}\n\n"
-            f"Remember: respond using the format **Answer:**, **Reason:**, **Sources:** (bullet points). "
-            f"Be detailed. If the context does not contain the answer, say so."
+            f"### IMPORTANT -- You MUST respond in this exact format:\n\n"
+            f"**Answer:** [Write a detailed answer in 2-4 sentences]\n\n"
+            f"**Reason:** [Explain in 2-3 sentences why, referencing the context]\n\n"
+            f"**Sources:**\n"
+            f"- [Source 1] Section, page -- brief description\n"
+            f"- [Source 2] Section, page -- brief description\n\n"
+            f"Do NOT give a one-line answer. If the context does not contain the answer, say so."
         ),
     })
 
@@ -632,7 +637,7 @@ def query_api(prompt, context_chunks, leniency=50, provider="deepseek", model="d
     payload = {
         "model": model,
         "messages": messages,
-        "max_tokens": 500,
+        "max_tokens": 1024,
         "temperature": temperature,
     }
 
@@ -711,66 +716,56 @@ def generate_suggested_questions(paper_info):
     return suggestions[:6]
 
 
-def _generate_summary_with_jarvis(context_text, filename):
-    """Use Jarvis Mk.X (fine-tuned Qwen3-8B) to generate a paper summary.
-    Loads the model on demand, generates summary, then unloads."""
-    import gc
-    from bot import JarvisBot
+def _generate_summary_with_deepseek(context_text, filename):
+    """Use DeepSeek-V3.2 API to generate a professional paper summary."""
+    import requests
 
-    bot = JarvisBot(
-        base_model_name="Qwen/Qwen3-8B",
-        adapter_path="models/jarvis-mkx-qwen3-8b-adapter",
-        embed_model_name=_get_embed_model_name(),
-        load_in_4bit=True,
-        is_qwen3=True,
+    # Truncate context to fit API limits (approx 4000 tokens / 16k chars)
+    max_context_chars = 16000 
+    if len(context_text) > max_context_chars:
+        context_text = context_text[:max_context_chars] + "\n[...truncated...]"
+
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if not api_key:
+        return "Error: DEEPSEEK_API_KEY not found in .env file."
+
+    url = "https://api.deepseek.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    prompt = (
+        f"You are an expert academic assistant. Read the following text from the research paper '{filename}' "
+        f"and write a high-quality, professional summary. \n\n"
+        f"CRITICAL: Do NOT simply copy the abstract. Synthesize the findings in your own words. "
+        f"Cover: (1) Core Objective, (2) Methodology, (3) Key Results, and (4) Significance.\n\n"
+        f"PAPER CONTENT:\n{context_text}\n\n"
+        f"Professional Summary (4-6 sentences):"
     )
 
+    payload = {
+        "model": "deepseek-chat", # This maps to DeepSeek-V3.2
+        "messages": [
+            {"role": "system", "content": "You are a research paper summarizer. You provide original, synthesis-based summaries."},
+            {"role": "user", "content": prompt}
+        ],
+        "max_tokens": 600,
+        "temperature": 0.5,
+    }
+
     try:
-        bot.load_model()
-
-        prompt = (
-            f"Summarize this research paper in 3-5 sentences. "
-            f"Cover: (1) what the paper is about, (2) the main methodology, "
-            f"(3) the key findings or conclusions.\n\n"
-            f"### Context from Research Paper:\n{context_text}\n\n"
-            f"### Question:\nProvide a concise summary of this paper."
-        )
-
-        messages = [
-            {"role": "system", "content": "You are Jarvis Mk.X. Summarize the research paper concisely in 3-5 sentences."},
-            {"role": "user", "content": prompt},
-        ]
-
-        template_kwargs = dict(
-            tokenize=True, add_generation_prompt=True,
-            return_tensors="pt", return_dict=True,
-            enable_thinking=False,
-        )
-        encoded = bot.tokenizer.apply_chat_template(messages, **template_kwargs)
-        input_ids = encoded["input_ids"].to(bot.model.device)
-        attention_mask = encoded["attention_mask"].to(bot.model.device)
-
-        with torch.no_grad():
-            outputs = bot.model.generate(
-                input_ids, attention_mask=attention_mask,
-                max_new_tokens=500, temperature=0.3,
-                do_sample=True, repetition_penalty=1.1,
-            )
-        summary = bot.tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True).strip()
-        return summary
-
-    finally:
-        bot.unload_model()
-        gc.collect()
-        try:
-            torch.cuda.empty_cache()
-        except Exception:
-            pass
+        r = requests.post(url, headers=headers, json=payload, timeout=60)
+        r.raise_for_status()
+        return r.json()["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        return f"DeepSeek Summary Error: {e}"
 
 
 def format_sources_for_db(sources):
     return [
-        {"section": s.section, "page_numbers": s.page_numbers,
+        {"chunk_id": s.chunk_id,
+         "section": s.section, "page_numbers": s.page_numbers,
          "score": round(s.score, 4),
          "method": getattr(s, "retrieval_method", "unknown"),
          "text": s.text,
@@ -860,10 +855,10 @@ def create_method_breakdown(sources):
     fig.add_trace(go.Bar(name="Sparse (BM25)", x=labels, y=sparse_est, marker_color="#ff9944"))
     fig.update_layout(
         barmode="stack", title="Dense vs Sparse Score Breakdown",
-        yaxis_title="Score", height=250,
-        margin=dict(l=10, r=10, t=35, b=10),
+        yaxis_title="Score", height=280,
+        margin=dict(l=10, r=10, t=60, b=10),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font={"color": "#ccc"}, legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        font={"color": "#ccc"}, legend=dict(orientation="h", yanchor="bottom", y=1),
     )
     return fig
 
@@ -894,69 +889,126 @@ def create_answer_keywords(answer_text):
     return fig
 
 
-def create_3d_vector_space(query_text, sources, embed_model):
-    """3D PCA scatter plot: query point vs retrieved chunk points with hover text."""
+def create_3d_vector_space(query_text, sources, embed_model, all_chunks=None):
+    """3D PCA scatter plot: ALL chunks shown, retrieved chunks highlighted, query as diamond."""
     if not sources or len(sources) < 2:
         return None
     try:
         from sklearn.decomposition import PCA
 
-        chunk_previews = [
-            (s.get("text") or s.get("text_preview", ""))[:150].replace("\n", " ")
-            for s in sources
-        ]
-        texts = [query_text] + [s.get("text") or s.get("text_preview", "")[:200] for s in sources]
-        scores = [1.0] + [s.get("score", 0) for s in sources]
-        methods = ["query"] + [s.get("method", "hybrid") for s in sources]
-        sections = ["Query"] + [s.get("section", "?")[:30] for s in sources]
+        # Build text lists from all chunks
+        if all_chunks and len(all_chunks) > 0:
+            chunk_texts = [c.text[:300] if hasattr(c, "text") else str(c)[:300] for c in all_chunks]
+            chunk_sections = [c.section[:30] if hasattr(c, "section") else "?" for c in all_chunks]
+            num_chunks = len(all_chunks)
+        else:
+            # Fallback: only show retrieved chunks
+            chunk_texts = [(s.get("text") or s.get("text_preview", ""))[:300] for s in sources]
+            chunk_sections = [s.get("section", "?")[:30] for s in sources]
+            num_chunks = len(sources)
 
-        embeddings = embed_model.encode(texts, normalize_embeddings=True)
+        # Match retrieved sources to chunk indices
+        # Try chunk_id first, fall back to text matching
+        retrieved_indices = {}  # index_in_all_chunks -> source_info
+        for s in sources:
+            cid = s.get("chunk_id", -1)
+            matched_idx = None
+
+            # Method 1: direct chunk_id match
+            if isinstance(cid, int) and 0 <= cid < num_chunks:
+                matched_idx = cid
+
+            # Method 2: text matching (fallback for older messages without chunk_id)
+            if matched_idx is None:
+                src_text = (s.get("text") or s.get("text_preview", ""))[:100]
+                if src_text:
+                    for i, ct in enumerate(chunk_texts):
+                        if ct[:100] == src_text[:100] and i not in retrieved_indices:
+                            matched_idx = i
+                            break
+
+            if matched_idx is not None:
+                retrieved_indices[matched_idx] = {
+                    "score": s.get("score", 0),
+                    "method": s.get("method", "hybrid"),
+                    "section": s.get("section", "?")[:30],
+                    "preview": (s.get("text") or s.get("text_preview", ""))[:150].replace("\n", " "),
+                }
+
+        # Embed everything
+        all_texts = [query_text] + chunk_texts
+        embeddings = embed_model.encode(all_texts, normalize_embeddings=True)
         pca = PCA(n_components=3)
         coords = pca.fit_transform(embeddings)
 
         fig = go.Figure()
 
-        # ── Chunk points with hover ──────────────────────────────────────
-        for i in range(1, len(coords)):
-            sc = scores[i]
+        # ── Non-retrieved chunks (small, gray) ───────────────────────────
+        nr_x, nr_y, nr_z, nr_hover = [], [], [], []
+        for i in range(num_chunks):
+            if i not in retrieved_indices:
+                ci = i + 1  # +1 because index 0 is query
+                nr_x.append(coords[ci, 0])
+                nr_y.append(coords[ci, 1])
+                nr_z.append(coords[ci, 2])
+                preview = chunk_texts[i][:100].replace("\n", " ")
+                nr_hover.append(
+                    f"<b>Chunk {i}: {chunk_sections[i]}</b><br>"
+                    f"<i>{preview}...</i>"
+                )
+
+        if nr_x:
+            fig.add_trace(go.Scatter3d(
+                x=nr_x, y=nr_y, z=nr_z,
+                mode="markers",
+                marker=dict(size=4, color="#555555", opacity=0.35,
+                            line=dict(width=0.5, color="#777777")),
+                name=f"Other chunks ({len(nr_x)})",
+                hovertext=nr_hover, hoverinfo="text",
+            ))
+
+        # ── Retrieved chunks (large, colored, white border) ──────────────
+        for idx, info in retrieved_indices.items():
+            ci = idx + 1  # +1 because index 0 is query
+            sc = info["score"]
             color = "#44ff88" if sc > 0.5 else "#ffcc00" if sc > 0.3 else "#4da6ff"
-            size = max(8, sc * 18)
-            method_label = methods[i].title()
+            size = max(10, sc * 20)
             hover = (
-                f"<b>Chunk {i}: {sections[i]}</b><br>"
-                f"Score: {sc:.3f} | Method: {method_label}<br>"
-                f"<i>{chunk_previews[i-1]}...</i>"
+                f"<b>[RETRIEVED] Chunk {idx}: {info['section']}</b><br>"
+                f"Score: {sc:.3f} | Method: {info['method'].title()}<br>"
+                f"<i>{info['preview']}...</i>"
             )
             fig.add_trace(go.Scatter3d(
-                x=[coords[i, 0]], y=[coords[i, 1]], z=[coords[i, 2]],
+                x=[coords[ci, 0]], y=[coords[ci, 1]], z=[coords[ci, 2]],
                 mode="markers",
-                marker=dict(size=size, color=color, opacity=0.85,
-                            line=dict(width=1.5, color="white")),
-                name=f"Chunk {i} ({sc:.3f})",
+                marker=dict(size=size, color=color, opacity=0.9,
+                            line=dict(width=2, color="white")),
+                name=f"Retrieved {idx} ({sc:.3f})",
                 hovertext=hover, hoverinfo="text",
             ))
             # Dashed line to query
             fig.add_trace(go.Scatter3d(
-                x=[coords[0, 0], coords[i, 0]],
-                y=[coords[0, 1], coords[i, 1]],
-                z=[coords[0, 2], coords[i, 2]],
+                x=[coords[0, 0], coords[ci, 0]],
+                y=[coords[0, 1], coords[ci, 1]],
+                z=[coords[0, 2], coords[ci, 2]],
                 mode="lines",
                 line=dict(color=color, width=2, dash="dash"),
                 showlegend=False, opacity=0.3, hoverinfo="skip",
             ))
 
-        # ── Query point (diamond) ────────────────────────────────────────
+        # ── Query point (red diamond) ────────────────────────────────────
         fig.add_trace(go.Scatter3d(
             x=[coords[0, 0]], y=[coords[0, 1]], z=[coords[0, 2]],
             mode="markers+text", text=["Query"],
             textposition="top center", textfont=dict(size=11, color="#ff6666"),
-            marker=dict(size=12, color="#ff4444", symbol="diamond", opacity=1.0,
+            marker=dict(size=14, color="#ff4444", symbol="diamond", opacity=1.0,
                         line=dict(width=2, color="white")),
             name="Your Query",
             hovertext=f"<b>Query</b><br>{query_text[:120]}...",
             hoverinfo="text",
         ))
 
+        n_retrieved = len(retrieved_indices)
         fig.update_layout(
             scene=dict(
                 xaxis_title=f"PC1 ({pca.explained_variance_ratio_[0]:.0%})",
@@ -964,9 +1016,15 @@ def create_3d_vector_space(query_text, sources, embed_model):
                 zaxis_title=f"PC3 ({pca.explained_variance_ratio_[2]:.0%})",
                 bgcolor="rgba(0,0,0,0)",
             ),
-            height=550, margin=dict(l=0, r=0, t=10, b=0),
+            height=600, margin=dict(l=0, r=0, t=10, b=0),
             paper_bgcolor="rgba(0,0,0,0)", font={"color": "#ccc"},
-            legend=dict(font=dict(size=9), bgcolor="rgba(0,0,0,0.5)"),
+            legend=dict(font=dict(size=9), bgcolor="rgba(0,0,0,0.5)",
+                        yanchor="top", y=0.75, xanchor="right", x=0.99),
+            annotations=[dict(
+                text=f"{num_chunks} total chunks | {n_retrieved} retrieved | Red = Query",
+                showarrow=False, xref="paper", yref="paper",
+                x=0.5, y=0, font=dict(size=11, color="#888"),
+            )],
         )
         return fig
     except Exception as e:
@@ -1446,33 +1504,27 @@ else:
                     with st.spinner(f"Processing {uf.name}..."):
                         paper = processor.process(filepath)
 
-                    # Generate summary using Jarvis Mk.X (our fine-tuned model)
-                    with st.spinner(f"Jarvis Mk.X is summarizing {uf.name}..."):
-                        # Build context from abstract + intro + conclusion
+                    # Generate summary using DeepSeek-V3.2
+                    with st.spinner(f"DeepSeek-V3.2 is analyzing {uf.name}..."):
                         summary_parts = []
                         if paper.abstract:
-                            summary_parts.append(f"[Abstract]\n{paper.abstract[:2500]}")
+                            summary_parts.append(f"[Abstract]\n{paper.abstract[:1500]}")
+                        
                         for sec_name, content in paper.sections.items():
-                            if any(kw in sec_name.lower() for kw in ["introduction", "conclusion", "summary"]):
-                                summary_parts.append(f"[{sec_name}]\n{content[:1500]}")
-                        if not summary_parts and paper.sections:
-                            first_sec = list(paper.sections.values())[0]
-                            summary_parts.append(f"[Opening]\n{first_sec[:2500]}")
+                            sec_lower = sec_name.lower()
+                            # Feed DeepSeek more context since it's an API with larger limits
+                            if any(kw in sec_lower for kw in ["introduction", "conclusion", "results", "method"]):
+                                summary_parts.append(f"[{sec_name}]\n{content[:2000]}")
 
                         summary_context = "\n\n---\n\n".join(summary_parts) if summary_parts else "No text extracted."
 
                         try:
-                            summary = _generate_summary_with_jarvis(summary_context, uf.name)
+                            # Call the new DeepSeek function
+                            summary = _generate_summary_with_deepseek(summary_context, uf.name)
                         except Exception as e:
-                            print(f"Jarvis summary failed: {e}")
-                            # Fallback to raw abstract
-                            if paper.abstract:
-                                summary = paper.abstract[:500]
-                            elif paper.sections:
-                                summary = list(paper.sections.values())[0][:500]
-                            else:
-                                summary = "Summary generation failed."
+                            summary = "Summary generation failed."
 
+                    # Update the database record
                     add_pdf(session_id=session_id, filename=uf.name, filepath=filepath,
                             summary=summary, num_pages=paper.num_pages,
                             num_chunks=len(paper.chunks),
@@ -1509,7 +1561,7 @@ else:
                     <strong>{pdf['filename']}</strong> — {pdf['num_pages']}p, {pdf['num_chunks']} chunks<br>
                     <em>{pdf['summary']}</em><br>
                     <span style="font-size:0.7em; color:#93c5fd; opacity:0.7;">
-                    Generated by Jarvis Mk.X</span></div>""", unsafe_allow_html=True)
+                    Generated using DeepSeek V3.2 API model</span></div>""", unsafe_allow_html=True)
 
     if st.session_state.suggested_questions and active_pdfs:
         st.markdown("**Suggested:**")
@@ -1599,14 +1651,18 @@ else:
 
                     # ── Row 4: 3D Vector Space (UMAP/PCA) ─────────────────
                     if sources and len(sources) >= 2:
-                        st.markdown("**3D Vector Space — Query vs Retrieved Chunks**")
-                        st.caption("Red diamond = your query | "
-                                   "Green = high score | Yellow = medium | Blue = low. "
-                                   "Hover to see chunk text.")
+                        st.markdown("**3D Vector Space -- Query vs All Chunks**")
+                        st.caption("Gray = all paper chunks | "
+                                   "Colored + white border = retrieved chunks (green=high, yellow=mid, blue=low) | "
+                                   "Red diamond = your query. Hover any point to see chunk text.")
                         prev_user = [m for m in messages if m["id"] < msg["id"] and m["role"] == "user"]
                         query_text = prev_user[-1]["content"] if prev_user else "query"
                         bot = get_bot()
-                        fig = create_3d_vector_space(query_text, sources, bot.retriever.embed_model)
+                        all_chunks = st.session_state.get("all_chunks_cache", [])
+                        fig = create_3d_vector_space(
+                            query_text, sources, bot.retriever.embed_model,
+                            all_chunks=all_chunks if all_chunks else None,
+                        )
                         if fig:
                             st.plotly_chart(fig, width="stretch",
                                             key=f"chart_3d_{msg['id']}")
